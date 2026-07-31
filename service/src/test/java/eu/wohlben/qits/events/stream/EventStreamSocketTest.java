@@ -79,6 +79,11 @@ class EventStreamSocketTest {
   }
 
   private static io.restassured.response.Response publish(String id, String name, String payload) {
+    return publish(id, name, payload, null);
+  }
+
+  private static io.restassured.response.Response publish(
+      String id, String name, String payload, String parentId) {
     return given()
         .contentType(ContentType.JSON)
         .body(
@@ -86,7 +91,9 @@ class EventStreamSocketTest {
                 + name
                 + "\",\"occurredAt\":\"2026-07-31T12:46:03Z\",\"payload\":"
                 + quoted(payload)
-                + ",\"description\":null}")
+                + ",\"description\":null,\"parentId\":"
+                + (parentId == null ? "null" : "\"" + parentId + "\"")
+                + "}")
         .when()
         .put("/events/api/events/" + id);
   }
@@ -139,11 +146,14 @@ class EventStreamSocketTest {
       String id = record(name, "{\"branch\":\"main\"}");
       JsonNode frame = nextFrame(subscriber);
 
-      // The five fields of the wire contract, in the contract's order, and NOT createdAt/updatedAt:
-      // those are this database's bookkeeping, not facts about the thing that happened.
+      // The six fields of the wire contract, and NOT createdAt/updatedAt: those are this database's
+      // bookkeeping, not facts about the thing that happened. Their ORDER is no longer part of the
+      // contract — both sides bind by name — but the set is, and so is the fact that a sixth field
+      // was APPENDED: a subscriber built against the first five reads the frame it always read.
       List<String> fields = new ArrayList<>();
       frame.fieldNames().forEachRemaining(fields::add);
-      assertEquals(List.of("id", "name", "occurredAt", "payload", "description"), fields);
+      assertEquals(
+          List.of("id", "name", "occurredAt", "payload", "description", "parentId"), fields);
 
       assertEquals(id, frame.get("id").asText());
       assertEquals(name, frame.get("name").asText());
@@ -152,6 +162,29 @@ class EventStreamSocketTest {
       // canonical JSON — not re-parsed into an object and not reformatted.
       assertEquals("{\"branch\":\"main\"}", frame.get("payload").asText());
       assertEquals("recorded by the suite", frame.get("description").asText());
+      // An explicit null, not an omission: a subscriber reads "this event is a root" off the frame
+      // rather than off a missing key, which is the only reading that stays true when it is set.
+      assertTrue(frame.get("parentId").isNull());
+    }
+  }
+
+  @Test
+  void aFrameCarriesTheCauseTheEventWasPublishedUnder() throws Exception {
+    // The whole point of the field being on the frame rather than only on the read model: a
+    // subscriber drawing a release train sees the edge as the event arrives, with nothing to poll.
+    String name = aSignature("Caused");
+    String parent = UUID.randomUUID().toString();
+    String id = UUID.randomUUID().toString();
+    try (FakeSubscriber subscriber = FakeSubscriber.dial(endpoint)) {
+      subscriber.subscribe(name);
+      awaitSubscribed(name);
+
+      publish(id, name, "{\"attempt\":1}", parent).then().statusCode(201);
+      JsonNode frame = nextFrame(subscriber);
+      assertEquals(id, frame.get("id").asText());
+      assertEquals(parent, frame.get("parentId").asText());
+      // The parent is an id this log has never seen, and the frame carries it all the same —
+      // nothing orders a parent's arrival before its child's.
     }
   }
 

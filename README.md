@@ -13,7 +13,7 @@ of what is here; nothing below describes a plan.
 
 | | |
 |---|---|
-| `Event` | a name, an `occurredAt`, an optional `payload` and an optional description — plus the row's own `createdAt`/`updatedAt` |
+| `Event` | a name, an `occurredAt`, an optional `payload`, an optional description and an optional `parentId` — plus the row's own `createdAt`/`updatedAt` |
 
 The three timestamps are not redundant. `occurredAt` is the **caller's** — when the thing happened,
 supplied on write and freely in the past, because a log is mostly written after the fact — while
@@ -21,12 +21,33 @@ supplied on write and freely in the past, because a log is mostly written after 
 becomes indistinguishable from one recorded as it happened, which is the one distinction an event
 log exists to keep. Listing is ordered by `occurredAt`, never by insertion.
 
+`parentId` is the id of the event that **caused** this one, or null for a root — the platform's
+causation edge, and the one relation this table has. It records what a timeline cannot: a release
+train is an event firing a build, the build publishing an event, that event firing another build,
+and without the edge each hop is an unrelated row distinguishable from coincidence only by reading
+timestamps and guessing.
+
+**A `parentId` this log cannot resolve is data, not an error, and there is no foreign key.** Nothing
+orders a parent's arrival before its child's — publishes are independent HTTP calls, and a parent
+whose first attempt failed sits in the publisher's outbox for minutes while its child lands on the
+first try. An existence check would refuse that child with a 400, which is unretryable, so the
+publisher's outbox would mark it FAILED and a timing accident would become permanent data loss. The
+same argument covers the first retention policy and a parent from a publisher this instance never
+heard from. A reader treats an unresolvable parent as the start of the chain.
+
 ## What it deliberately does NOT own
 
 Any relation to another context's rows. An event that comes to name a project, a repository or a
 deployment will name it by **String id** in a column of its own — those rows live in another
 physical database and no foreign key can span one. That is the platform-wide rule, not a
 this-repo preference.
+
+Any *view* of a causation chain. There is no `/chain` route, no depth parameter, no root filter and
+no graph endpoint: `parentId` on a read walks upwards, `?parentId=` walks downwards, and a tree
+endpoint would have to settle depth limits, cycle handling and ordering before anyone has drawn the
+picture. **Nor is there a cycle guard.** One that caught only the self-edge would be worse than
+none — it cannot see `A → B → A` while telling a reader that cycles have been handled — so a
+chain-walking client bounds its own depth and remembers the ids it has visited.
 
 There is no MCP server here. That was true of the websocket too until this service became the
 platform's **bus**, and the sentence is worth keeping in its new form: a literal route is not free.
@@ -96,26 +117,59 @@ The envelope is one shape in both directions:
 { "name": "BuildSuccessful",
   "occurredAt": "2026-07-31T12:46:03Z",
   "payload": "{\"branch\":\"main\",\"repoId\":\"qits-ci\"}",
-  "description": null }
+  "description": null,
+  "parentId": null }
 ```
 
 `payload` is the publishing event class's own fields as **canonical JSON in a string**. This service
 stores and compares it verbatim and never reformats it: canonicalization is the publisher's job, and
-the equality below is the only reason a retry is safe.
+the equality below is the only reason a retry is safe. `parentId` is envelope, never payload — the
+payload is compared byte for byte, so a cause that entered it would make one event published under
+two parents two events nothing could reconcile.
+
+**`parentId` may be absent, and absent means null.** That is the whole of this contract's backward
+compatibility: a publisher that never learned about the field keeps working, which is why this
+service ships before any publisher that stamps. The reverse order is the unsafe one — a stamping
+publisher against a service without the column has its parents silently dropped, and chains recorded
+as roots cannot be backfilled.
 
 The publish has three answers and no fourth — `201` for an id this log has not seen, `200` for the
-same `name`/`occurredAt`/`payload` arriving again (nothing written, nothing pushed), `400` for an id
-that exists with anything different, which is a reused UUID and not something a retry fixes.
-`description` is deliberately outside that comparison: it is the human account, not part of the
-event's identity. `POST /events/api/events` stays what it was, for recording something by hand.
+same `name`/`occurredAt`/`payload`/`parentId` arriving again (nothing written, nothing pushed),
+`400` for an id that exists with anything different, which is a reused UUID and not something a
+retry fixes. `description` is deliberately outside that comparison and `parentId` is deliberately
+inside it: the line is identity of the occurrence versus prose about it, and two PUTs of one id
+claiming different causes are two different claims about history. Two more `400`s belong to the
+cause — a `parentId` that is not a canonical UUID, and a `parentId` equal to the event's own id,
+since an event cannot cause itself. A `parentId` this log has never seen is **not** one of them.
+`POST /events/api/events` stays what it was, for recording something by hand, and takes an optional
+`parentId` validated identically so the two write paths cannot diverge about what an event is.
 
 A subscriber connects to `/events/stream` and sends one frame — `{"subscribe": ["BuildSuccessful"]}`,
 which *replaces* that connection's set; `["*"]` means everything — and is then pushed
-`{"id", "name", "occurredAt", "payload", "description"}` for each newly created matching event.
-`name` doubles as the **signature** a subscriber matches on. Live only, at-most-once: no replay, no
-offset, no catch-up. That is a deliberate omission rather than a gap — catch-up reads the event log
-itself and is a separate feature — and the envelope carries the id precisely so it can be built
-without breaking anyone.
+`{"id", "name", "occurredAt", "payload", "description", "parentId"}` for each newly created matching
+event. `name` doubles as the **signature** a subscriber matches on. The field *order* is not part of
+the contract — both sides bind by name — but appending is: a subscriber built against the first five
+fields reads the frame it always read. Live only, at-most-once: no replay, no offset, no catch-up.
+That is a deliberate omission rather than a gap — catch-up reads the event log itself and is a
+separate feature — and the envelope carries the id precisely so it can be built without breaking
+anyone.
+
+## Walking a chain
+
+Two affordances, and there is no third:
+
+    GET /events/api/events/{id}              → the event, whose parentId is its cause  (upwards)
+    GET /events/api/events?parentId=<id>     → that event's children, newest first     (downwards)
+
+Downwards is the shape a release train actually has — one release fans out to N builds — and a
+client cannot do it without listing the whole log, which is why it is served. An unknown parent is
+an **empty list, not a 404**: this log cannot tell a wrong id from one that has not arrived yet, and
+"nothing was caused by it as far as I know" is true in both cases. A blank value is treated as
+absent, so `?parentId=` is the whole log.
+
+It is a query parameter on the route that already exists, and that is not only economy: a new
+literal under `/events` would need an entry in `quarkus.quinoa.ignored-path-prefixes` in the same
+commit. This is the one addition that needs none, so this feature does not touch that key at all.
 
 ## The client
 
@@ -131,7 +185,7 @@ That gives this repo a clone rule with two halves:
     git clone … && git submodule update --init
 
 - **The test suite needs neither node nor the submodule.** Quinoa is disabled by default in test
-  mode (`Quinoa is disabled by default in tests.`), so all 45 `@QuarkusTest`s are green against an
+  mode (`Quinoa is disabled by default in tests.`), so all 64 `@QuarkusTest`s are green against an
   empty `webui/` on a machine with no node at all — `./mvnw test`, measured.
 - **Anything that reaches `package` needs both**, and that includes `./mvnw verify`, which runs
   `package` on its way to failsafe. An uninitialised gitlink is an *empty directory*, and that is

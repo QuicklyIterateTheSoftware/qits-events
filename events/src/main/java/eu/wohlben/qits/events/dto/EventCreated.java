@@ -7,15 +7,25 @@ import java.time.Instant;
  * The envelope of a <em>newly created</em> event: the exact frame {@code /events/stream} pushes, and
  * the in-process signal the control layer fires to get it pushed.
  *
- * <p>The five components and their order are the wire contract, so this record's JSON <b>is</b> the
- * frame:
+ * <p>The components are the wire contract, so this record's JSON <b>is</b> the frame:
  *
- * <pre>{@code {"id": "<uuid>", "name": "…", "occurredAt": "…", "payload": "…", "description": null}}</pre>
+ * <pre>{@code {"id": "<uuid>", "name": "…", "occurredAt": "…", "payload": "…", "description": null,
+ * "parentId": null}}</pre>
+ *
+ * <p><b>Their order is not.</b> It was, while there were five of them; the clause is retired now
+ * that there are six, because both sides bind by name and the publishing library disables
+ * {@code FAIL_ON_UNKNOWN_PROPERTIES} precisely so a subscriber built against five fields survives a
+ * sixth. Which is also the rule for the next one: <b>append</b>, so an old subscriber reads the
+ * frame it always read.
  *
  * <p>Adding a component here changes what every subscriber receives. The row's own {@code
  * createdAt}/{@code updatedAt} are absent on purpose — they are this database's bookkeeping, not
  * facts about the thing that happened — and {@code id} is present on purpose: it is what a later
  * catch-up protocol will resume from, which is why the live-only stream carries it today.
+ *
+ * <p>{@code parentId} — the id of the event that caused this one, or null for a root — is here for
+ * the same reason {@code id} is: it is a fact about the occurrence, and a subscriber watching the
+ * stream draw a release train has no other way to learn the edge.
  *
  * <p><b>Fired only on create.</b> An idempotent {@code PUT} that replays an id already stored
  * answers 200 and fires nothing; a subscriber that received the event once must never receive it
@@ -29,4 +39,9 @@ import java.time.Instant;
  */
 @RegisterForReflection
 public record EventCreated(
-    String id, String name, Instant occurredAt, String payload, String description) {}
+    String id,
+    String name,
+    Instant occurredAt,
+    String payload,
+    String description,
+    String parentId) {}

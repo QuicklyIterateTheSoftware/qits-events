@@ -2,7 +2,10 @@ package eu.wohlben.qits.events.api;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.contains;
+import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.hasItem;
+import static org.hamcrest.Matchers.hasKey;
 import static org.hamcrest.Matchers.notNullValue;
 import static org.hamcrest.Matchers.nullValue;
 
@@ -24,11 +27,20 @@ import org.junit.jupiter.api.Test;
 class EventApiTest {
 
   private String create(String name, String occurredAt, String payload, String description) {
+    return create(name, occurredAt, payload, description, null);
+  }
+
+  private String create(
+      String name, String occurredAt, String payload, String description, String parentId) {
     return given()
         .contentType(ContentType.JSON)
         .body(
             new EventController.CreateEventRequest(
-                name, occurredAt == null ? null : Instant.parse(occurredAt), payload, description))
+                name,
+                occurredAt == null ? null : Instant.parse(occurredAt),
+                payload,
+                description,
+                parentId))
         .when()
         .post("/events/api/events")
         .then()
@@ -89,6 +101,82 @@ class EventApiTest {
         .body(
             "events.findAll { it.name.startsWith('" + prefix + "') }.name",
             contains(prefix + "newest", prefix + "middle", prefix + "oldest"));
+  }
+
+  @Test
+  void theListFilteredByParentIsThatEventsChildrenNewestFirst() {
+    // The downward half of a chain walk, and the shape a release train actually has: one event fans
+    // out to N. A client cannot do this without listing the whole log, which is the reason the
+    // parameter exists — and it is a PARAMETER rather than a route precisely so that no new literal
+    // under /events needs a quarkus.quinoa.ignored-path-prefixes entry.
+    String prefix = "children-" + System.nanoTime() + "-";
+    String parent = create(prefix + "parent", "2026-01-01T00:00:00Z", null, null);
+    String stranger = create(prefix + "stranger", "2026-01-01T00:00:00Z", null, null);
+    create(prefix + "middle", "2026-06-01T00:00:00Z", null, null, parent);
+    create(prefix + "oldest", "2026-02-01T00:00:00Z", null, null, parent);
+    create(prefix + "newest", "2026-12-01T00:00:00Z", null, null, parent);
+    create(prefix + "somebody-elses", "2026-12-02T00:00:00Z", null, null, stranger);
+
+    given()
+        .queryParam("parentId", parent)
+        .when()
+        .get("/events/api/events")
+        .then()
+        .statusCode(200)
+        .body("events.name", contains(prefix + "newest", prefix + "middle", prefix + "oldest"));
+  }
+
+  @Test
+  void anUnknownParentIsAnEmptyListRatherThanAFourOhFour() {
+    // This log cannot tell "wrong id" from "not here yet" from "another publisher's", and "nothing
+    // was caused by it as far as I know" is the true answer in all three cases. A 404 would also
+    // make a chain-walking client treat a gap as a failure rather than as the end of the chain.
+    given()
+        .queryParam("parentId", java.util.UUID.randomUUID().toString())
+        .when()
+        .get("/events/api/events")
+        .then()
+        .statusCode(200)
+        .body("events", empty());
+
+    // Not even a UUID: still a question with a true answer, and GET stays tolerant of any String id
+    // the way it always has — only the publish path demands a canonical one.
+    given()
+        .queryParam("parentId", "not-a-uuid")
+        .when()
+        .get("/events/api/events")
+        .then()
+        .statusCode(200)
+        .body("events", empty());
+  }
+
+  @Test
+  void anEmptyParentIdParameterIsTheWholeLogRatherThanNoLogAtAll() {
+    // `?parentId=` is a client that meant to ask for everything and said it clumsily. Blank is
+    // absent, which keeps the parameterless behaviour the one default.
+    String id = create("Whole log " + System.nanoTime(), "2026-07-31T09:00:00Z", null, null);
+    given()
+        .queryParam("parentId", "")
+        .when()
+        .get("/events/api/events")
+        .then()
+        .statusCode(200)
+        .body("events.id", hasItem(id));
+  }
+
+  @Test
+  void aHandRecordedEventCarriesTheParentIdKeyWhetherOrNotItHasOne() {
+    // hasKey rather than nullValue(): an absent JSON path also reads as null, so only the key
+    // proves the field is on the wire. A consumer's "does this service know about causation?" is
+    // exactly that check.
+    String id = create("Rootless " + System.nanoTime(), "2026-07-31T09:00:00Z", null, null);
+    given()
+        .when()
+        .get("/events/api/events/" + id)
+        .then()
+        .statusCode(200)
+        .body("event", hasKey("parentId"))
+        .body("event.parentId", nullValue());
   }
 
   @Test

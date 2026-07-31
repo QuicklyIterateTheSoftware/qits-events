@@ -14,7 +14,7 @@ inheriting them, and why every suite runs on in-memory H2.
 right because the platform reference states it loosely:
 
 - `./mvnw test` — needs **neither node nor the webui submodule**. Quinoa is disabled by default in
-  test mode (it says so: `Quinoa is disabled by default in tests.`), so all 45 `@QuarkusTest`s pass
+  test mode (it says so: `Quinoa is disabled by default in tests.`), so all 64 `@QuarkusTest`s pass
   against an empty `webui/` on a machine with no node at all — the stream socket included, since
   a websocket is not a Quinoa concern. Measured, not assumed.
 - `./mvnw verify` — runs `package` on its way to failsafe, and `package` is where Quinoa augments.
@@ -136,10 +136,29 @@ Three things about it are load-bearing here:
   reformatted the value — pretty-printing it, reordering keys, parsing and re-serializing it — would
   break the byte-for-byte equality the idempotent PUT rests on, and the break would look like
   "publishers keep getting 400 on their own retries".
-- **The comparison is `name` + `occurredAt` + `payload`, and `description` is outside it** on
-  purpose: the human account is not part of an event's identity. `occurredAt` is truncated to
+- **The comparison is `name` + `occurredAt` + `payload` + `parentId`, and `description` is outside
+  it** on purpose. The line is *identity of the occurrence* versus *prose about it*: the human
+  account is not part of an event's identity, and a cause is — it is machine-consumed structure and
+  the edge a chain is drawn from, so two PUTs of one id claiming different parents are two different
+  claims about history. Kept outside, the server would silently keep the first and answer 200 while
+  the publisher believed it had published the second: two services disagreeing about the shape of
+  history with no error anywhere. It costs a well-behaved publisher nothing, because an outbox
+  stores the envelope whole and its own two attempts cannot disagree. `occurredAt` is truncated to
   microseconds on the way in, because the column is `timestamp(6)` and comparing the caller's
   nanoseconds against the database's microseconds would 400 a publisher's honest retry.
+- **`parentId` is validated twice and checked never.** It must be a canonical UUID when present, and
+  it may not equal the event's own id — both decidable from a single row, so both 400. There is
+  deliberately **no existence check and no FK**: nothing orders a parent's arrival before its
+  child's, and 400 is unretryable, so a check would turn a publisher's timing accident into
+  permanent data loss. A dangling parent is data. The reasoning is written where the check would
+  otherwise live (`EventService.causeOf`) and in `V3__parent_id.sql`; if a future change makes it
+  look like an oversight, read those first.
+- **The field is on the wire as an explicit `null`.** Absent-means-null is the contract's one
+  backward-compatibility clause (an older publisher keeps working), but this service always *emits*
+  the key — a consumer probes for it to learn whether this service knows about causation, so an
+  omit-nulls Jackson customizer here would be a silent break. `PackagedSurfaceIT` pins it with
+  `hasKey`, not `nullValue()`: an absent JSON path also reads as null, so `nullValue()` alone would
+  go on passing through the break.
 - **Only a *create* broadcasts.** A 200 replay pushes nothing — a subscriber must not see an event
   twice because a network dropped an acknowledgement. That is why the CDI signal is named
   `EventCreated`, fired from `EventService` (so both write paths cannot diverge about it) and
@@ -148,6 +167,17 @@ Three things about it are load-bearing here:
 `EventCreated` carries `@RegisterForReflection`: it is serialized by Jackson directly rather than as
 a JAX-RS return type, so nothing else tells the native-image builder its accessors are reachable. Without
 it the JVM suite stays green and the binary pushes `{}`.
+
+Its javadoc used to call the five components *and their order* the contract. The order clause is
+retired — both sides bind by name, and the publishing library disables `FAIL_ON_UNKNOWN_PROPERTIES`
+precisely so a subscriber built against five fields survives a sixth. The rule that replaced it is
+**append**, so an old subscriber goes on reading the frame it always read.
+
+The read model for causation is two things and stays two: `parentId` on `EventDto` (upwards, with
+the `GET /{id}` that already exists) and `?parentId=` on the list route (downwards,
+`EventRepository.listChildrenOf`, which is what `idx_event_parent_id` is for). A query parameter
+rather than a route because a new literal under `/events` would need an
+`ignored-path-prefixes` entry in the same commit — this feature is the one that needs none.
 
 The fan-out never blocks and never throws upwards. It runs on the thread that completed the create's
 transaction, so `sendTextAndAwait` — which is `sendText(…).await().indefinitely()` under a friendlier

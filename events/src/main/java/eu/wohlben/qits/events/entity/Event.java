@@ -54,6 +54,25 @@ public class Event extends PanacheEntityBase {
   /** The long-form account. Optional: a name and a time are the whole of what an event must have. */
   public String description;
 
+  /**
+   * The id of the event that <b>caused</b> this one, or null for a root — the platform's causation
+   * edge, and the only relation this table has.
+   *
+   * <p>Envelope data, not payload: the publisher's canonical JSON is compared byte for byte, so a
+   * cause that entered it would make the same event published under two different parents two
+   * events this server could not reconcile. It is part of the identity of the occurrence all the
+   * same, which is why the idempotent {@code PUT} compares it and leaves {@link #description} out.
+   *
+   * <p><b>Not validated against this table, deliberately, and there is no FK.</b> Nothing orders a
+   * parent's arrival before its child's — an existence check would 400 a child whose parent is
+   * still sitting in a publisher's outbox, and 400 is unretryable, so a timing accident would
+   * become permanent data loss. A parent id this log cannot resolve is a true statement about
+   * causation that this log has not (or no longer has) the other half of; the reader treats it as
+   * the start of a chain. See {@code V3__parent_id.sql}.
+   */
+  @Column(name = "parent_id")
+  public String parentId;
+
   @CreationTimestamp
   @Column(name = "created_at", nullable = false, updatable = false)
   public Instant createdAt;

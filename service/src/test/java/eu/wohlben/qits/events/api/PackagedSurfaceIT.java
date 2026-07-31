@@ -256,18 +256,30 @@ public class PackagedSurfaceIT {
       assertNotNull(frame, "the packaged artifact's stream pushed nothing");
       assertTrue(frame.contains("\"name\":\"" + signature + "\""), frame);
       assertTrue(frame.contains("\"payload\":\"{\\\"probe\\\":true}\""), frame);
+      // The envelope above never mentions parentId — an older publisher's exact bytes — and the
+      // frame carries it as an explicit null all the same. Both halves of the compatibility clause
+      // in one assertion, on the artifact.
+      assertTrue(frame.contains("\"parentId\":null"), frame);
     }
   }
 
   @Test
   public void theIdempotentPublishAnswersTwoOhOneThenTwoHundredThenFourHundred() {
     // On the artifact rather than only in a @QuarkusTest, because this is also the only place the
-    // V2 payload column is exercised against the SHIPPED file-H2 through Flyway's real migration
-    // resources — the shape a native image drops silently.
+    // V2 payload and V3 parent_id columns are exercised against the SHIPPED file-H2 through
+    // Flyway's real migration resources — the shape a native image drops silently.
+    //
+    // The envelope carries parentId here for exactly that reason: a migration that never ran, a
+    // column MapStruct maps by a name the native image dropped, or an omit-nulls mapper are all
+    // invisible to a @QuarkusTest and all fatal to the publisher that ships next.
+    String parent = UUID.randomUUID().toString();
     String id = UUID.randomUUID().toString();
     String envelope =
         "{\"name\":\"PackagedPublish\",\"occurredAt\":\"2026-07-31T12:46:03Z\","
-            + "\"payload\":\"{\\\"repoId\\\":\\\"qits-events\\\"}\",\"description\":null}";
+            + "\"payload\":\"{\\\"repoId\\\":\\\"qits-events\\\"}\",\"description\":null,"
+            + "\"parentId\":\""
+            + parent
+            + "\"}";
 
     given()
         .contentType(ContentType.JSON)
@@ -276,7 +288,8 @@ public class PackagedSurfaceIT {
         .put("/events/api/events/" + id)
         .then()
         .statusCode(201)
-        .body("event.payload", org.hamcrest.Matchers.equalTo("{\"repoId\":\"qits-events\"}"));
+        .body("event.payload", org.hamcrest.Matchers.equalTo("{\"repoId\":\"qits-events\"}"))
+        .body("event.parentId", org.hamcrest.Matchers.equalTo(parent));
 
     given()
         .contentType(ContentType.JSON)
@@ -286,9 +299,29 @@ public class PackagedSurfaceIT {
         .then()
         .statusCode(200);
 
+    // Read back through the list route's ?parentId= filter, which is the read model this feature
+    // adds and the one query the V3 index exists for. The parent itself was never published — a
+    // dangling cause is data, so the children query answers about it all the same.
+    given()
+        .queryParam("parentId", parent)
+        .when()
+        .get("/events/api/events")
+        .then()
+        .statusCode(200)
+        .body("events.id", org.hamcrest.Matchers.contains(id));
+
     given()
         .contentType(ContentType.JSON)
         .body(envelope.replace("qits-events\\\"}", "somebody-else\\\"}"))
+        .when()
+        .put("/events/api/events/" + id)
+        .then()
+        .statusCode(400);
+
+    // The cause is inside the comparison too: one id may not be re-published under another parent.
+    given()
+        .contentType(ContentType.JSON)
+        .body(envelope.replace(parent, UUID.randomUUID().toString()))
         .when()
         .put("/events/api/events/" + id)
         .then()
@@ -301,6 +334,33 @@ public class PackagedSurfaceIT {
         .put("/events/api/events/not-a-uuid")
         .then()
         .statusCode(400);
+  }
+
+  @Test
+  public void aRootEventCarriesTheParentIdKeyOnTheWire() {
+    // hasKey, not nullValue(): an absent JSON path reads as null too, and the difference is the
+    // whole of what a consumer can rely on — the publisher that ships next probes for this key to
+    // decide whether this service knows about causation. Asserted on the ARTIFACT because an
+    // omit-nulls Jackson customizer or a dropped record component is exactly the class of change a
+    // @QuarkusTest cannot distinguish from the right behaviour.
+    String id =
+        given()
+            .contentType(ContentType.JSON)
+            .body("{\"name\":\"PackagedRoot\",\"occurredAt\":\"2026-07-31T09:00:00Z\"}")
+            .when()
+            .post("/events/api/events")
+            .then()
+            .statusCode(200)
+            .extract()
+            .path("event.id");
+
+    given()
+        .when()
+        .get("/events/api/events/" + id)
+        .then()
+        .statusCode(200)
+        .body("event", org.hamcrest.Matchers.hasKey("parentId"))
+        .body("event.parentId", org.hamcrest.Matchers.nullValue());
   }
 
   private static void deleteRecursively(Path root) {

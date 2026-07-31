@@ -2,6 +2,7 @@ package eu.wohlben.qits.events.api;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.hasKey;
 import static org.hamcrest.Matchers.notNullValue;
 import static org.hamcrest.Matchers.nullValue;
 
@@ -26,6 +27,24 @@ class EventPublishApiTest {
   private static final String PAYLOAD =
       "{\\\"branch\\\":\\\"main\\\",\\\"commitSha\\\":\\\"abc123\\\",\\\"repoId\\\":\\\"qits-ci\\\"}";
 
+  /** The envelope as a publisher that knows about causation sends it — {@code parentId} always present. */
+  private static String envelope(String name, String occurredAt, String payload, String parentId) {
+    return "{\"name\":\""
+        + name
+        + "\",\"occurredAt\":\""
+        + occurredAt
+        + "\",\"payload\":"
+        + (payload == null ? "null" : "\"" + payload + "\"")
+        + ",\"description\":null,\"parentId\":"
+        + (parentId == null ? "null" : "\"" + parentId + "\"")
+        + "}";
+  }
+
+  /**
+   * The envelope <b>without</b> the field at all — what a publisher built against the five-field
+   * contract sends, and what this service must go on accepting. That compatibility clause is the
+   * reason this side ships before any publisher that stamps.
+   */
   private static String envelope(String name, String occurredAt, String payload) {
     return "{\"name\":\""
         + name
@@ -117,5 +136,137 @@ class EventPublishApiTest {
     String body = envelope("SomethingHappened", "2026-07-31T12:46:03Z", null);
     put(id, body).then().statusCode(201).body("event.payload", nullValue());
     put(id, body).then().statusCode(200);
+  }
+
+  @Test
+  void aPublishMayNameTheEventThatCausedIt() {
+    String parent = UUID.randomUUID().toString();
+    String id = UUID.randomUUID().toString();
+    String body = envelope("BuildSuccessful", "2026-07-31T12:46:03Z", PAYLOAD, parent);
+
+    put(id, body).then().statusCode(201).body("event.parentId", equalTo(parent));
+    // ... and the same bytes again are the same event, cause and all.
+    put(id, body).then().statusCode(200).body("event.parentId", equalTo(parent));
+
+    given()
+        .when()
+        .get("/events/api/events/" + id)
+        .then()
+        .statusCode(200)
+        .body("event.parentId", equalTo(parent));
+  }
+
+  @Test
+  void theParentIdKeyIsPresentEvenWhenThereIsNoParent() {
+    // hasKey, not nullValue(): a JSON path that is ABSENT also reads as null, and the difference is
+    // the whole of what a client can rely on. A consumer checking "does this service know about
+    // causation?" looks for the key, so an omit-nulls mapper here would be a silent contract break
+    // that every assertion phrased as nullValue() would go on passing through.
+    String id = UUID.randomUUID().toString();
+    put(id, envelope("BuildSuccessful", "2026-07-31T12:46:03Z", PAYLOAD, null))
+        .then()
+        .statusCode(201)
+        .body("event", hasKey("parentId"))
+        .body("event.parentId", nullValue());
+
+    given().when().get("/events/api/events/" + id).then().body("event", hasKey("parentId"));
+  }
+
+  @Test
+  void anEnvelopeThatNeverLearnedAboutTheFieldIsStillAccepted() {
+    // The contract's one backward-compatibility clause: absent is legal and means null. A publisher
+    // built against the five-field envelope keeps working, which is what makes it safe to ship this
+    // service before the publishers that stamp — and it is one-directional, so the other order
+    // (a stamping publisher against an events service without the column) is the one that loses
+    // parents silently.
+    String id = UUID.randomUUID().toString();
+    String body = envelope("BuildSuccessful", "2026-07-31T12:46:03Z", PAYLOAD);
+    put(id, body).then().statusCode(201).body("event.parentId", nullValue());
+    put(id, body).then().statusCode(200);
+    // Absent and an explicit null are the same statement, so one replays as the other.
+    put(id, envelope("BuildSuccessful", "2026-07-31T12:46:03Z", PAYLOAD, null))
+        .then()
+        .statusCode(200);
+  }
+
+  @Test
+  void reParentingOneIdIsFourHundredInBothDirections() {
+    // parentId is INSIDE the comparison, unlike description. Two PUTs of one id claiming different
+    // causes are two different claims about history; kept outside, the server would keep the first
+    // and answer 200 while the publisher believed it had published the second — two services
+    // disagreeing about the shape of history with no error anywhere.
+    String first = UUID.randomUUID().toString();
+    String parent = UUID.randomUUID().toString();
+    put(first, envelope("BuildSuccessful", "2026-07-31T12:46:03Z", PAYLOAD, null))
+        .then()
+        .statusCode(201);
+    // null → set
+    put(first, envelope("BuildSuccessful", "2026-07-31T12:46:03Z", PAYLOAD, parent))
+        .then()
+        .statusCode(400)
+        .contentType(ContentType.JSON)
+        .body("message", notNullValue());
+
+    String second = UUID.randomUUID().toString();
+    put(second, envelope("BuildSuccessful", "2026-07-31T12:46:03Z", PAYLOAD, parent))
+        .then()
+        .statusCode(201);
+    // set → null, and set → a different one
+    put(second, envelope("BuildSuccessful", "2026-07-31T12:46:03Z", PAYLOAD, null))
+        .then()
+        .statusCode(400);
+    put(
+            second,
+            envelope(
+                "BuildSuccessful",
+                "2026-07-31T12:46:03Z",
+                PAYLOAD,
+                UUID.randomUUID().toString()))
+        .then()
+        .statusCode(400);
+  }
+
+  @Test
+  void aParentThatIsNotAUuidIsFourHundred() {
+    put(
+            UUID.randomUUID().toString(),
+            envelope("BuildSuccessful", "2026-07-31T12:46:03Z", PAYLOAD, "not-a-uuid"))
+        .then()
+        .statusCode(400)
+        .contentType(ContentType.JSON);
+    // UUID.fromString alone accepts this; the round-trip check is what does not.
+    put(
+            UUID.randomUUID().toString(),
+            envelope("BuildSuccessful", "2026-07-31T12:46:03Z", PAYLOAD, "1-1-1-1-1"))
+        .then()
+        .statusCode(400);
+  }
+
+  @Test
+  void anEventMayNotCauseItself() {
+    // Decidable from a single row, with no graph to consult — malformed input in the same sense a
+    // non-UUID is. Note what is NOT here: no cycle guard. One that caught only the self-edge would
+    // be worse than none, because it cannot see A → B → A while telling a reader cycles are handled.
+    String id = UUID.randomUUID().toString();
+    put(id, envelope("BuildSuccessful", "2026-07-31T12:46:03Z", PAYLOAD, id))
+        .then()
+        .statusCode(400)
+        .contentType(ContentType.JSON)
+        .body("message", notNullValue());
+    given().when().get("/events/api/events/" + id).then().statusCode(404);
+  }
+
+  @Test
+  void aParentThisLogHasNeverSeenIsAcceptedRatherThanRefused() {
+    // Nothing orders a parent's arrival before its child's, and 400 is unretryable — so an
+    // existence check would turn a publisher's timing accident into permanent data loss. A dangling
+    // parent is data; the reader treats it as the start of the chain.
+    String neverSeen = UUID.randomUUID().toString();
+    String id = UUID.randomUUID().toString();
+    put(id, envelope("BuildSuccessful", "2026-07-31T12:46:03Z", PAYLOAD, neverSeen))
+        .then()
+        .statusCode(201)
+        .body("event.parentId", equalTo(neverSeen));
+    given().when().get("/events/api/events/" + neverSeen).then().statusCode(404);
   }
 }

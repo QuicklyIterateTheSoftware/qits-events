@@ -36,7 +36,7 @@ class EventPublishTest extends EventsTestSupport {
     String id = aUuid();
     Instant when = Instant.parse("2026-07-31T12:46:03Z");
 
-    Published published = eventService.publish(id, "BuildSuccessful", when, PAYLOAD, null);
+    Published published = eventService.publish(id, "BuildSuccessful", when, PAYLOAD, null, null);
 
     assertEquals(PublishOutcome.CREATED, published.outcome());
     // The id is the PUBLISHER's, not one this service invented — that is the whole mechanism.
@@ -49,9 +49,9 @@ class EventPublishTest extends EventsTestSupport {
   void theSameEventArrivingTwiceIsAReplayAndWritesNothing() {
     String id = aUuid();
     Instant when = Instant.parse("2026-07-31T12:46:03Z");
-    eventService.publish(id, "BuildSuccessful", when, PAYLOAD, "first attempt");
+    eventService.publish(id, "BuildSuccessful", when, PAYLOAD, "first attempt", null);
 
-    Published again = eventService.publish(id, "BuildSuccessful", when, PAYLOAD, "first attempt");
+    Published again = eventService.publish(id, "BuildSuccessful", when, PAYLOAD, "first attempt", null);
 
     assertEquals(PublishOutcome.REPLAYED, again.outcome());
     assertEquals(1, eventService.list().size(), "a replay must not land a second row");
@@ -64,9 +64,9 @@ class EventPublishTest extends EventsTestSupport {
     // written, so the stored account stays the one that was committed.
     String id = aUuid();
     Instant when = Instant.parse("2026-07-31T12:46:03Z");
-    eventService.publish(id, "BuildSuccessful", when, PAYLOAD, "as first sent");
+    eventService.publish(id, "BuildSuccessful", when, PAYLOAD, "as first sent", null);
 
-    Published again = eventService.publish(id, "BuildSuccessful", when, PAYLOAD, "reworded");
+    Published again = eventService.publish(id, "BuildSuccessful", when, PAYLOAD, "reworded", null);
 
     assertEquals(PublishOutcome.REPLAYED, again.outcome());
     inFreshTx(() -> assertEquals("as first sent", eventService.get(id).description));
@@ -80,9 +80,9 @@ class EventPublishTest extends EventsTestSupport {
     // represent.
     String id = aUuid();
     Instant nanos = Instant.parse("2026-07-31T12:46:03Z").plusNanos(123_456_789L);
-    eventService.publish(id, "BuildSuccessful", nanos, PAYLOAD, null);
+    eventService.publish(id, "BuildSuccessful", nanos, PAYLOAD, null, null);
 
-    Published again = eventService.publish(id, "BuildSuccessful", nanos, PAYLOAD, null);
+    Published again = eventService.publish(id, "BuildSuccessful", nanos, PAYLOAD, null, null);
 
     assertEquals(PublishOutcome.REPLAYED, again.outcome());
     inFreshTx(
@@ -94,14 +94,21 @@ class EventPublishTest extends EventsTestSupport {
   void aReusedUuidIsUnretryableRatherThanAConflictToPollOn() {
     String id = aUuid();
     Instant when = Instant.parse("2026-07-31T12:46:03Z");
-    eventService.publish(id, "BuildSuccessful", when, PAYLOAD, null);
+    eventService.publish(id, "BuildSuccessful", when, PAYLOAD, null, null);
 
     for (Runnable differing :
         List.<Runnable>of(
-            () -> eventService.publish(id, "SomethingElse", when, PAYLOAD, null),
-            () -> eventService.publish(id, "BuildSuccessful", when.plusSeconds(1), PAYLOAD, null),
-            () -> eventService.publish(id, "BuildSuccessful", when, "{\"branch\":\"other\"}", null),
-            () -> eventService.publish(id, "BuildSuccessful", when, null, null))) {
+            () -> eventService.publish(id, "SomethingElse", when, PAYLOAD, null, null),
+            () ->
+                eventService.publish(
+                    id, "BuildSuccessful", when.plusSeconds(1), PAYLOAD, null, null),
+            () ->
+                eventService.publish(
+                    id, "BuildSuccessful", when, "{\"branch\":\"other\"}", null, null),
+            () -> eventService.publish(id, "BuildSuccessful", when, null, null, null),
+            // ... and the fourth field, new here: two PUTs of one id claiming different causes are
+            // two different claims about history, in BOTH directions.
+            () -> eventService.publish(id, "BuildSuccessful", when, PAYLOAD, null, aUuid()))) {
       assertThrows(BadRequestException.class, differing::run);
     }
   }
@@ -111,11 +118,11 @@ class EventPublishTest extends EventsTestSupport {
     Instant when = Instant.parse("2026-07-31T12:46:03Z");
     assertThrows(
         BadRequestException.class,
-        () -> eventService.publish("not-a-uuid", "BuildSuccessful", when, PAYLOAD, null));
+        () -> eventService.publish("not-a-uuid", "BuildSuccessful", when, PAYLOAD, null, null));
     // UUID.fromString alone accepts this; the round-trip check is what does not.
     assertThrows(
         BadRequestException.class,
-        () -> eventService.publish("1-1-1-1-1", "BuildSuccessful", when, PAYLOAD, null));
+        () -> eventService.publish("1-1-1-1-1", "BuildSuccessful", when, PAYLOAD, null, null));
     assertEquals(List.of(), eventService.list());
   }
 
@@ -125,20 +132,100 @@ class EventPublishTest extends EventsTestSupport {
     // invented could never replay equal to itself.
     assertThrows(
         BadRequestException.class,
-        () -> eventService.publish(aUuid(), "BuildSuccessful", null, PAYLOAD, null));
+        () -> eventService.publish(aUuid(), "BuildSuccessful", null, PAYLOAD, null, null));
   }
 
   @Test
   void aPublishedEventNeedsNoPayloadEither() {
     String id = aUuid();
     Instant when = Instant.parse("2026-07-31T12:46:03Z");
-    Published published = eventService.publish(id, "SomethingHappened", when, null, null);
+    Published published = eventService.publish(id, "SomethingHappened", when, null, null, null);
     assertEquals(PublishOutcome.CREATED, published.outcome());
     assertNull(published.event().payload);
 
     // ... and null must compare equal to null on the replay, not fall into the mismatch branch.
     assertEquals(
         PublishOutcome.REPLAYED,
-        eventService.publish(id, "SomethingHappened", when, null, null).outcome());
+        eventService.publish(id, "SomethingHappened", when, null, null, null).outcome());
+  }
+
+  @Test
+  void aParentThisLogHasNeverSeenIsStoredAsItStands() {
+    // THE decision this feature rests on. Nothing orders a parent's arrival before its child's:
+    // publishes are independent HTTP calls, and a parent whose inline attempt failed sits in the
+    // publisher's outbox for minutes while its child lands on the first try. An existence check
+    // would 400 that child — unretryable, so the outbox marks it FAILED — and a timing accident
+    // would become permanent data loss. A dangling parent is data; the reader treats it as a root.
+    String id = aUuid();
+    String neverSeen = aUuid();
+    Instant when = Instant.parse("2026-07-31T12:46:03Z");
+
+    Published published =
+        eventService.publish(id, "BuildSuccessful", when, PAYLOAD, null, neverSeen);
+
+    assertEquals(PublishOutcome.CREATED, published.outcome());
+    assertEquals(neverSeen, published.event().parentId);
+    inFreshTx(() -> assertEquals(neverSeen, eventService.get(id).parentId));
+  }
+
+  @Test
+  void theSameEventUnderTheSameParentIsStillAReplay() {
+    String parent = aUuid();
+    String id = aUuid();
+    Instant when = Instant.parse("2026-07-31T12:46:03Z");
+    eventService.publish(id, "BuildSuccessful", when, PAYLOAD, null, parent);
+
+    assertEquals(
+        PublishOutcome.REPLAYED,
+        eventService.publish(id, "BuildSuccessful", when, PAYLOAD, null, parent).outcome());
+  }
+
+  @Test
+  void aParentThatIsNotAUuidIsRefused() {
+    // Same guard as the id itself: a cause is an id of this table, and a caller that cannot spell
+    // one is naming nothing.
+    Instant when = Instant.parse("2026-07-31T12:46:03Z");
+    assertThrows(
+        BadRequestException.class,
+        () -> eventService.publish(aUuid(), "BuildSuccessful", when, PAYLOAD, null, "not-a-uuid"));
+    assertThrows(
+        BadRequestException.class,
+        () -> eventService.publish(aUuid(), "BuildSuccessful", when, PAYLOAD, null, "1-1-1-1-1"));
+    assertEquals(List.of(), eventService.list());
+  }
+
+  @Test
+  void anEventMayNotCauseItself() {
+    // Decidable from one row with no graph to consult, so it is validation rather than analysis —
+    // which is exactly why the length-two cycle is NOT refused here. A guard that caught only the
+    // self-edge and let A → B → A through would tell a reader that cycles have been handled.
+    String id = aUuid();
+    Instant when = Instant.parse("2026-07-31T12:46:03Z");
+    assertThrows(
+        BadRequestException.class,
+        () -> eventService.publish(id, "BuildSuccessful", when, PAYLOAD, null, id));
+    assertEquals(List.of(), eventService.list());
+  }
+
+  @Test
+  void theChildrenOfAnEventAreListedNewestFirstAndNobodyElsesAre() {
+    String parent = aUuid();
+    String other = aUuid();
+    eventService.publish(
+        aUuid(), "Middle", Instant.parse("2026-06-01T00:00:00Z"), null, null, parent);
+    eventService.publish(
+        aUuid(), "Oldest", Instant.parse("2026-01-01T00:00:00Z"), null, null, parent);
+    eventService.publish(
+        aUuid(), "Newest", Instant.parse("2026-12-01T00:00:00Z"), null, null, parent);
+    eventService.publish(
+        aUuid(), "SomebodyElses", Instant.parse("2026-12-02T00:00:00Z"), null, null, other);
+    eventService.publish(aUuid(), "ARoot", Instant.parse("2026-12-03T00:00:00Z"), null, null, null);
+
+    assertEquals(
+        List.of("Newest", "Middle", "Oldest"),
+        eventService.listChildrenOf(parent).stream().map(e -> e.name).toList());
+    // An id nothing names is an empty list, never an absence: this log cannot tell "wrong" from
+    // "not here yet", and "nothing was caused by it as far as I know" is true either way.
+    assertEquals(List.of(), eventService.listChildrenOf(aUuid()));
   }
 }

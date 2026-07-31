@@ -46,4 +46,19 @@ final class Validations {
       throw new BadRequestException(field + " must be a UUID");
     }
   }
+
+  /**
+   * {@link #requireUuid}, but null is fine — the shape an <em>optional</em> id takes.
+   *
+   * <p>Null and blank are both "no value": a JSON field that is absent binds to null, and one sent
+   * as {@code ""} is a client that meant to say nothing and said it clumsily. Neither is an error,
+   * and neither is stored — see {@code EventService}, which normalises before it compares, so that
+   * "no parent" is one value rather than two that fail to replay as each other.
+   */
+  static void requireUuidIfPresent(String value, String field) {
+    if (value == null || value.isBlank()) {
+      return;
+    }
+    requireUuid(value, field);
+  }
 }

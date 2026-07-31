@@ -26,7 +26,7 @@ class EventServiceTest extends EventsTestSupport {
   void createReadDelete() {
     Instant when = Instant.parse("2026-07-31T09:00:00Z");
     Event event =
-        eventService.create("Deployed qits-events", when, "{\"version\":\"1\"}", "First boot");
+        eventService.create("Deployed qits-events", when, "{\"version\":\"1\"}", "First boot", null);
     assertNotNull(event.id);
     assertEquals(when, event.occurredAt);
     assertNotNull(event.createdAt);
@@ -45,14 +45,14 @@ class EventServiceTest extends EventsTestSupport {
   void aManuallyRecordedEventNeedsNoPayload() {
     // The POST path stays what it was: a name and a time are the whole of what an event must have,
     // and the bus's structured half is optional rather than a new obligation on a person.
-    Event event = eventService.create("By hand", Instant.parse("2026-07-31T09:00:00Z"), null, null);
+    Event event = eventService.create("By hand", Instant.parse("2026-07-31T09:00:00Z"), null, null, null);
     assertNull(event.payload);
   }
 
   @Test
   void anOmittedOccurredAtDefaultsToNow() {
     Instant before = Instant.now().truncatedTo(ChronoUnit.MILLIS);
-    Event event = eventService.create("Right now", null, null, null);
+    Event event = eventService.create("Right now", null, null, null, null);
     assertFalse(event.occurredAt.isBefore(before));
   }
 
@@ -60,7 +60,7 @@ class EventServiceTest extends EventsTestSupport {
   void anEventMayBeRecordedInThePast() {
     // The normal case, not an edge one: a log is mostly written after the fact.
     Instant longAgo = Instant.parse("2020-01-01T00:00:00Z");
-    Event event = eventService.create("Backfilled", longAgo, null, null);
+    Event event = eventService.create("Backfilled", longAgo, null, null, null);
     assertEquals(longAgo, event.occurredAt);
     // ... and the row's own timestamps do not follow it, which is the whole reason there are three.
     assertTrue(event.createdAt.isAfter(longAgo));
@@ -69,17 +69,43 @@ class EventServiceTest extends EventsTestSupport {
   @Test
   void listIsNewestFirstByWhenItHappened() {
     // Insertion order deliberately disagrees with occurrence order — that is what is under test.
-    eventService.create("Middle", Instant.parse("2026-06-01T00:00:00Z"), null, null);
-    eventService.create("Oldest", Instant.parse("2026-01-01T00:00:00Z"), null, null);
-    eventService.create("Newest", Instant.parse("2026-12-01T00:00:00Z"), null, null);
+    eventService.create("Middle", Instant.parse("2026-06-01T00:00:00Z"), null, null, null);
+    eventService.create("Oldest", Instant.parse("2026-01-01T00:00:00Z"), null, null, null);
+    eventService.create("Newest", Instant.parse("2026-12-01T00:00:00Z"), null, null, null);
 
     List<String> names = eventService.list().stream().map(e -> e.name).toList();
     assertEquals(List.of("Newest", "Middle", "Oldest"), names);
   }
 
   @Test
+  void aHandRecordedEventMayNameACauseToo() {
+    // The manual path takes a parentId and validates it exactly as publish does. A person recording
+    // by hand rarely has one, but a field the bus accepts and this path silently dropped would be
+    // two definitions of the envelope hiding behind one entity.
+    Instant when = Instant.parse("2026-07-31T09:00:00Z");
+    Event root = eventService.create("Root", when, null, null, null);
+    assertNull(root.parentId);
+
+    Event child = eventService.create("Caused", when, null, null, root.id);
+    assertEquals(root.id, child.parentId);
+    assertEquals(
+        List.of("Caused"),
+        eventService.listChildrenOf(root.id).stream().map(e -> e.name).toList());
+  }
+
+  @Test
+  void aHandRecordedEventsCauseIsValidatedTheSameWay() {
+    Instant when = Instant.parse("2026-07-31T09:00:00Z");
+    assertThrows(
+        BadRequestException.class, () -> eventService.create("Bad cause", when, null, null, "nope"));
+    // Blank is "no value" rather than an error — a client that meant to say nothing, clumsily — and
+    // it normalises to null so that "no parent" is ONE value that replays equal to itself.
+    assertNull(eventService.create("Blank cause", when, null, null, "  ").parentId);
+  }
+
+  @Test
   void blankNameIsRejected() {
-    assertThrows(BadRequestException.class, () -> eventService.create("  ", null, null, null));
+    assertThrows(BadRequestException.class, () -> eventService.create("  ", null, null, null, null));
   }
 
   @Test

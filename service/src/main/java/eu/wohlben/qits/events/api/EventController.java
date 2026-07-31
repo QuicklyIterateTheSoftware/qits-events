@@ -15,6 +15,7 @@ import jakarta.ws.rs.PUT;
 import jakarta.ws.rs.Path;
 import jakarta.ws.rs.PathParam;
 import jakarta.ws.rs.Produces;
+import jakarta.ws.rs.QueryParam;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import java.time.Instant;
@@ -50,9 +51,28 @@ public class EventController {
     public record Response(List<EventDto> events) {}
   }
 
+  /**
+   * The log, newest first — and, with {@code ?parentId=<id>}, the events that <em>one</em> event
+   * caused, which is the downward half of a chain walk.
+   *
+   * <p>A query parameter on the route that already exists rather than a route of its own, and that
+   * is not only economy: a new literal under {@code /events} would need an entry in {@code
+   * quarkus.quinoa.ignored-path-prefixes} in the same commit, which is this platform's standing
+   * trap. A parameter needs none, so this feature does not touch that key at all.
+   *
+   * <p>An unknown parent gives an empty list, not a 404 — see {@code EventService.listChildrenOf}.
+   * Blank is treated as absent: {@code ?parentId=} is a client that meant to ask for everything.
+   * There is deliberately no chain, depth or root endpoint; upwards is {@code GET /{id}} following
+   * {@code parentId}, downwards is this, and a client that walks either <b>must bound its own depth
+   * and remember the ids it has seen</b>, because nothing here prevents a cycle.
+   */
   @GET
-  public ListEventsRequest.Response list() {
-    return new ListEventsRequest.Response(eventService.list().stream().map(eventMapper::toDto).toList());
+  public ListEventsRequest.Response list(@QueryParam("parentId") String parentId) {
+    var events =
+        parentId == null || parentId.isBlank()
+            ? eventService.list()
+            : eventService.listChildrenOf(parentId);
+    return new ListEventsRequest.Response(events.stream().map(eventMapper::toDto).toList());
   }
 
   public record GetEventRequest() {
@@ -70,9 +90,18 @@ public class EventController {
    * something that already happened is the normal case — so a value in the past is accepted as it
    * stands. {@code payload} is optional too: an event recorded by hand is honestly nothing but a
    * name and a time.
+   *
+   * <p>{@code parentId} is optional here too, and validated exactly as it is on {@code PUT}: a
+   * canonical UUID if present, never the new event's own id. A person recording by hand rarely names
+   * a cause, but a field the bus accepts and this path dropped would be two definitions of an
+   * envelope behind one entity.
    */
   public record CreateEventRequest(
-      @NotBlank String name, Instant occurredAt, String payload, String description) {
+      @NotBlank String name,
+      Instant occurredAt,
+      String payload,
+      String description,
+      String parentId) {
     public record Response(EventDto event) {}
   }
 
@@ -80,21 +109,35 @@ public class EventController {
   public CreateEventRequest.Response create(@Valid CreateEventRequest request) {
     var event =
         eventService.create(
-            request.name(), request.occurredAt(), request.payload(), request.description());
+            request.name(),
+            request.occurredAt(),
+            request.payload(),
+            request.description(),
+            request.parentId());
     return new CreateEventRequest.Response(eventMapper.toDto(event));
   }
 
   /**
-   * The publish envelope — the same five fields the {@code /events/stream} frame carries, minus the
-   * id, which is in the path.
+   * The publish envelope — the same fields the {@code /events/stream} frame carries, minus the id,
+   * which is in the path.
    *
-   * <p>{@code occurredAt} is <b>required</b> here, unlike on {@code POST}: it is one of the three
-   * fields a replay is compared on, so an event whose time this server invented could never replay
-   * equal to itself. {@code payload} arrives as canonical JSON <em>in a string</em> and is stored
-   * and compared verbatim — this server does not canonicalize, the publisher does.
+   * <p>{@code occurredAt} is <b>required</b> here, unlike on {@code POST}: it is one of the fields a
+   * replay is compared on, so an event whose time this server invented could never replay equal to
+   * itself. {@code payload} arrives as canonical JSON <em>in a string</em> and is stored and compared
+   * verbatim — this server does not canonicalize, the publisher does.
+   *
+   * <p>{@code parentId} is the id of the event that caused this one. <b>Absent is legal and means
+   * null</b> — a publisher that never learned about the field keeps working, which is the whole of
+   * this contract's backward compatibility and the reason this service ships before any publisher
+   * that stamps. It is <em>inside</em> the replay comparison, though, so a second PUT of one id
+   * under a different cause is a 400 rather than a silent disagreement about history.
    */
   public record PublishEventRequest(
-      @NotBlank String name, @NotNull Instant occurredAt, String payload, String description) {
+      @NotBlank String name,
+      @NotNull Instant occurredAt,
+      String payload,
+      String description,
+      String parentId) {
     public record Response(EventDto event) {}
   }
 
@@ -103,11 +146,16 @@ public class EventController {
    *
    * <ul>
    *   <li><b>201</b> — the id was unknown; the row was created and pushed to matching subscribers
-   *   <li><b>200</b> — the id was known and {@code name}/{@code occurredAt}/{@code payload} match
-   *       exactly: the same event arriving twice. Nothing written, nothing pushed
+   *   <li><b>200</b> — the id was known and {@code name}/{@code occurredAt}/{@code payload}/{@code
+   *       parentId} match exactly: the same event arriving twice. Nothing written, nothing pushed
    *   <li><b>400</b> — the id was known and something differs (a reused UUID, which no retry fixes),
-   *       or the id is not a UUID at all
+   *       or the id is not a UUID at all, or {@code parentId} is not a UUID, or {@code parentId} is
+   *       the event's own id
    * </ul>
+   *
+   * <p>A {@code parentId} naming an event this log does not have is <b>not</b> one of them: it is
+   * stored as it stands, because nothing orders a parent's arrival before its child's. See {@code
+   * EventService}.
    *
    * <p>{@code RestResponse<T>} rather than a bare {@code Response}: the status has to vary and the
    * body type has to stay visible to the OpenAPI document, and only the typed form gives both.
@@ -122,7 +170,8 @@ public class EventController {
             request.name(),
             request.occurredAt(),
             request.payload(),
-            request.description());
+            request.description(),
+            request.parentId());
     var body = new PublishEventRequest.Response(eventMapper.toDto(published.event()));
     return RestResponse.status(
         published.outcome() == EventService.PublishOutcome.CREATED
