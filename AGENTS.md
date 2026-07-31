@@ -1,0 +1,209 @@
+# qits-events — working notes
+
+Read `README.md` first: it defines the boundary and lists the routes. This file is the working
+conventions on top of it.
+
+## The two rules that shape everything
+
+**A clone of this repo alone builds and tests green** — no monorepo, no docker, no prior
+`mvn install` elsewhere, no credentials. Anything that would break that is not a tradeoff to weigh;
+it is the thing this repo exists to avoid. That is why the poms duplicate versions instead of
+inheriting them, and why every suite runs on in-memory H2.
+
+**Which command is the gate depends on whether you have the client**, and this is worth getting
+right because the platform reference states it loosely:
+
+- `./mvnw test` — needs **neither node nor the webui submodule**. Quinoa is disabled by default in
+  test mode (it says so: `Quinoa is disabled by default in tests.`), so all 21 `@QuarkusTest`s pass
+  against an empty `webui/` on a machine with no node at all. Measured, not assumed.
+- `./mvnw verify` — runs `package` on its way to failsafe, and `package` is where Quinoa augments.
+  So verify needs **both**, and against an uninitialised submodule it fails with
+  `No package.json found in Web UI directory: 'src/main/webui'`. `docs/project-setup-quinoa-angular.md`
+  in the superproject says verify needs neither; that is true of the tests it runs and not of the
+  goal, and it is true of every SPA-serving service, not a wart of this one.
+
+**`service/` compiles to a GraalVM native image**, and it extends the clone-alone rule rather than
+qualifying it: `.sdkmanrc` names `25.0.2-graalce`, so `sdk env` gives you a `native-image` and
+`./mvnw package -Dnative` produces `service/target/qits-events` with no container involved.
+
+Two consequences worth stating before you reach for a dependency:
+
+- **A missing GraalVM does not fail the build.** Quarkus logs `Cannot find the native-image …
+  Attempting to fall back to container build` and shells docker with a 1.8 GB Mandrel image. Green
+  either way, so the fallback is easy to be in without noticing — recognise it by the image pull.
+- **Every dependency is a decision about what the builder has to be told.** Reflection, dynamic
+  proxies, `ServiceLoader`, resource loading by computed name and JNI/JNA all need registering, and
+  the failure lands at *runtime* in the binary while the JVM suite stays green. Prefer what is
+  already in the image — `ProcessBuilder` over a process library, `java.lang.foreign` over JNA.
+
+The one native-image trap this repo has already inherited by *not* doing it: **never put
+`AUTO_SERVER=TRUE` on the H2 url.** It makes H2 start its own TCP server, whose class a native image
+loads by name and therefore does not have; the binary dies in connection-pool warm-up before it binds
+a port, and every JVM run stays green. It cost qits-ci and qits-projects a release each.
+
+## Package and module conventions
+
+`eu.wohlben.qits.events.*` across `events/` and `service/`, with disjoint sub-packages so there is
+no split package, plus `eu.wohlben.qits.webui` for the bare-segment redirect (the same package name
+its siblings use, so the file is recognisable across repos):
+
+- `events/` — `entity`, `persistence`, `dto`, `mapper`, `control`, `error`. Framework-free in the
+  sense that matters: no JAX-RS. Entities are Panache active-record with public fields; mappers are
+  MapStruct `@Mapper(componentModel = "jakarta")`; errors carry an HTTP status code so the web layer
+  can map them without this module knowing what HTTP is.
+- `service/` — `api` (JAX-RS + the exception mapper), `security` (the header-reading mechanism).
+- `webui/` — `WebUiRedirect`, and only that.
+
+`control/` is flat and stays flat.
+
+Controller request/response shapes are **nested records** on the controller
+(`CreateEventRequest` / `CreateEventRequest.Response`): the wire contract for one operation lives
+beside the method that serves it, and the generated OpenAPI document names them after the operation
+rather than after a bag of shared DTOs.
+
+## Paths
+
+Everything is served under this service's gateway segment — see the table in the README. The thing
+that is easy to get wrong:
+
+**A new machine surface outside `/events/api` needs a line in
+`quarkus.quinoa.ignored-path-prefixes`, in the same commit.** Quinoa's SPA fallback is a catch-all at
+`/events/*` registered near-last, so a real route still wins — but a path matching *no* route is
+rerouted to `index.html` and answers `200 text/html`, which a machine client parses as data. Three
+facts about that key, all measured on sibling services:
+
+- Setting it **replaces** Quinoa's derivation rather than extending it. The derivation reads
+  `quarkus.rest.path` and `quarkus.http.non-application-root-path` and produces exactly `/api,/q` —
+  which is why those two are repeated by hand in the key today. Naming a third alone would
+  *un-ignore* both.
+- The values are matched **after** `ui-root-path` is stripped, so they are **relative**.
+  `/events/api` written there matches nothing at all and is indistinguishable from leaving the key
+  unset — the failure that hides.
+- `@WebSocket` and anything registered straight onto the Vert.x router do **not** follow
+  `quarkus.rest.path`; they take a literal path and need their own entry. websockets-next claims
+  only the upgrade handshake, so a plain GET on a socket path falls through to the SPA.
+
+The segment itself is spelled in **four** places that move together: `quarkus.quinoa.ui-root-path`,
+`quarkus.rest.path`, `quarkus.http.non-application-root-path`, and the client's `baseHref` in
+qits-spa-events' `angular.json` — the fourth in another repository, where no build here can check
+it. A `baseHref` that disagrees yields a page that loads and then fetches its own JavaScript from
+the wrong place, and no server-side test can see it.
+
+## Authentication
+
+Authentication happens at `qits-gateway`. This service resolves a principal from a trusted header
+(`X-Qits-User`, read by `events/security/ForwardAuthMechanism`) and authenticates nothing.
+
+**`identity.isAnonymous()` is not a security state** — it means "no name to record". A check of the
+form `if (identity.isAnonymous()) deny` would look like a security control and be worth nothing,
+because reaching this service at all already implies you are inside the trusted network.
+
+There is no auth variant to select and no authorization policy here, and roles are deliberately not
+resolved — the single role check the system has (`qits.auth.required-role`) is the gateway's. The
+gateway fixes its variant at **build** time (`-Dqits.variant`), so no env var and no properties file
+can put an open mechanism back under a gateway built as `oauth`. `X-Qits-*` is that gateway's
+reserved namespace: the whole prefix is stripped from every inbound request unconditionally, which
+is the entire reason a header can be trusted as an identity here.
+
+`ForwardAuthTest` exercises the real header through the real mechanism rather than
+`@TestSecurity`, on purpose. The header **is** the contract — nothing else ever produces a principal
+in a deployed service — so an annotation that fabricates an identity proves a path the deployment
+never takes. That is exactly how the bug ran unseen in qits-projects: it shipped a
+`SecurityIdentity` with no mechanism behind it, every recorded principal was null, and the
+annotation went on passing the whole time.
+
+Do not lift `events/security` into a shared `libs/qits-auth`. Every repo builds from a clone of
+itself alone, so ~115 lines duplicated per service is cheaper than a jar that has to travel to all of
+them; the duplication is the decision, not an oversight.
+
+## Schema changes
+
+`events/src/main/resources/db/events/migration/`, hand-written, its own lineage on its own
+datasource. Entities live in a **named** persistence unit (`events`), not the default one — there is
+no default datasource in this app at all, which is why
+`quarkus.hibernate-orm.events.packages` is set: without it an entity has no unit to belong to and
+the boot fails naming neither.
+
+## Dependencies
+
+**`quarkus-undertow` must never be on the classpath.** Its presence breaks Quinoa's production
+static serving — the client 404s from a build that was green — and it arrives *transitively* from
+anything servlet-shaped. Check before adding anything that sounds like a web framework:
+
+    ./mvnw -pl service -am dependency:tree | grep -i undertow
+
+**Quinoa is in no BOM**, so its version is pinned by hand, in the root pom's properties
+(`quinoa.version`) rather than beside the dependency. 2.8.2 is the last release built against a
+Quarkus *older* than the platform's 3.34.6; 2.8.3 is built against 3.36.2, ahead of us. Bump only
+when the platform's Quarkus passes the version a release is built against.
+
+## Tests
+
+- App-level config lives in `service/src/main/resources/application.properties` and **the tests
+  inherit it** — Quarkus reads main's copy during a test run and merges the test resources over it,
+  so `quarkus.rest.path` and the rest are already in effect. Never re-declare them in
+  `src/test/resources/application.properties`: a test copy is free to drift from the shipped one,
+  and then a green suite proves nothing about what actually starts. That file is for genuine
+  test-only overrides (in-memory H2, `clean-at-start`, the test port).
+- **`quarkus.http.test-port=0`, deliberately.** Quarkus' default test port is 8081, which on the
+  deployment host is the published address of the platform's own npm registry — so the default makes
+  the entire suite fail with `Port already bound: 8081` on the one machine this repo is most likely
+  to be built on. It also removes the `@QuarkusTest`-restart race the siblings carry as a documented
+  flake. The same value is passed to failsafe in `service/pom.xml`.
+- **`mvn verify` passing does not mean the app starts.** Augmentation runs per `@QuarkusTest`
+  regardless of packaging, so a missing `quarkus-maven-plugin` goal is invisible to the suite — it
+  happened in qits-projects, an `<executions>` block under a `<build>` whose `<testResources>` came
+  first, and only a boot caught it. `<packaging>quarkus</packaging>` is what closes that hole: it
+  binds the goals to the lifecycle, and removing `<extensions>true</extensions>` now fails with
+  "Unknown packaging: quarkus" rather than quietly building nothing.
+- **`PackagedSurfaceIT` is the only test that runs against the artifact, and the only one that ever
+  sees the client.** Quinoa is disabled in test mode, so no `@QuarkusTest` here has a client in it at
+  all — a unit test asserting anything about `/events/` would pass against a process serving nothing.
+  Every `@QuarkusTest` also augments in the build JVM, with the whole classpath present, reflection
+  unrestricted and an in-memory H2; a native image has none of those. It runs under `-Dnative`, and
+  `-DskipITs=false` runs it against the fast-jar:
+
+      ./mvnw -B -ntp verify -DskipITs=false
+
+  It relocates `user.home` under `target/` rather than restating the JDBC url, so the **shipped**
+  `${user.home}`-rooted url is itself what gets exercised.
+- **The probe list is the platform's**, from `docs/project-setup-quinoa-angular.md` in the
+  superproject, and any change touching the Quinoa setup re-runs it: `/events/` → 200 HTML with the
+  right `<base href>`; a deep link → 200 `index.html`; `/events/api/<real>` → the API's own answer;
+  `/events/api/nope` → 404 and **not the client**; every literal machine path, mistyped → 404.
+  Note the last two are asserted as "404 and not `index.html`" rather than "404 and not HTML": what
+  a mistyped path actually gets is Vert.x' own stock 53-byte `<h1>Resource not found</h1>`, which is
+  `text/html` and correct. The content type alone cannot tell the two apart — `index.html` is
+  `text/html` too — so the *absence of the client* is what is pinned.
+- A `Failed to start quarkus` / `Port already bound` failure is the known flake — `@QuarkusTest`
+  restarts racing for the test port. Re-run first; `test-port=0` is why it should not happen here.
+
+## The image and the pipeline
+
+`docker/Dockerfile` and `.config/qits/ci-post-receive.yml` are two halves of one thing, and the seam
+between them is the only reason either is interesting: **the client cannot be built inside a docker
+build.** It depends on `@qits/ui-components`, which lives only on the platform's own npm registry,
+and a `RUN` step reaches the public internet but reaches that registry by no address at all. So the
+pipeline step — which runs on `qits-net`, where it does resolve — installs and builds the bundle,
+and the Dockerfile's builder stage neuters Quinoa's install/ci/build commands to `--version` and
+packages what it was handed.
+
+Three things follow, and each is load-bearing:
+
+- **`.dockerignore` does NOT exclude the client's `dist/`.** That departs from the platform's Quinoa
+  reference, which does — here `dist/` is the payload, and excluding it fails the build at the
+  `test -f` guard. Every SPA-serving service in the platform carries the same departure.
+- **The two `package-manager-install` flags exist only on the Dockerfile's `mvnw` line**, because the
+  Mandrel builder image ships no node. They must never go into `application.properties`: a local or
+  CI build must use the node on `PATH`, so that no build silently downloads a toolchain. `22.22.0` is
+  the platform pin.
+- **The bundle is `cp`'d onto itself before the build.** Quinoa *moves* `build-dir` rather than
+  copying it, and overlayfs cannot rename a directory that still lives in a lower image layer — it
+  answers EXDEV and the JDK's fallback refuses a non-empty directory, dying with
+  `DirectoryNotEmptyException` seconds in. The `cp` re-materialises it in the layer that is about to
+  move it, which is why it has to be in that same `RUN`.
+
+The pipeline also rewrites `package-lock.json`'s `resolved` **origins** before `npm ci`: npm fetches
+tarballs by the absolute URL in the lockfile and ignores the configured registry, and npm's own
+`--replace-registry-host` is broken for a registry mounted under a path prefix. The committed
+lockfile keeps the developer-host origin, which is correct locally.

@@ -1,0 +1,6 @@
+[submodule "qits-spa-events"]
+	path = service/src/main/webui
+	url = https://github.com/QuicklyIterateTheSoftware/qits-spa-events.git
+	ignore = all
+	update = merge
+	branch = main

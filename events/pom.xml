@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>eu.wohlben.qits</groupId>
+        <artifactId>qits-events</artifactId>
+        <version>1.0.0-SNAPSHOT</version>
+        <relativePath>../pom.xml</relativePath>
+    </parent>
+
+    <!-- The events domain: a recorded thing that happened. A plain library jar — entities,
+         persistence, control, mapper, dto, error — with NO web/JAX-RS in it; the REST boundary is
+         `service`'s, the same split qits-projects' `domain`/`epics` and qits-ci's `ci` carry.
+
+         It owns its OWN named datasource + persistence unit + Flyway lineage — a separate
+         file-based H2 under ~/.qits/data/events (see
+         src/main/resources/META-INF/microprofile-config.properties, ordinal 100). That is not
+         ceremony for one table: it is what makes the deployment's
+         QUARKUS_DATASOURCE_EVENTS_JDBC_URL a complete statement about this context's storage, and
+         it is what would let the module be lifted out later moving files rather than data.
+
+         The directory is `events/` and the artifactId `qits-events-domain`: the directory names the
+         context, the artifactId names the layer (`eu.wohlben.qits:qits-events-events` would be
+         nonsense — the qits-ci precedent). -->
+    <artifactId>qits-events-domain</artifactId>
+    <name>qits-events :: domain</name>
+
+    <dependencies>
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-arc</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-hibernate-orm-panache</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-jdbc-h2</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-flyway</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-hibernate-validator</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.mapstruct</groupId>
+            <artifactId>mapstruct</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-junit</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <artifactId>maven-compiler-plugin</artifactId>
+            </plugin>
+            <plugin>
+                <artifactId>maven-surefire-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>

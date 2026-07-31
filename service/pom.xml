@@ -1,0 +1,176 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>eu.wohlben.qits</groupId>
+        <artifactId>qits-events</artifactId>
+        <version>1.0.0-SNAPSHOT</version>
+        <relativePath>../pom.xml</relativePath>
+    </parent>
+
+    <!-- The events SERVICE layer: the technical half. The JAX-RS route definitions over the events
+         domain, the exception mapper that turns this context's EventsException into its HTTP status,
+         the header-reading security mechanism, and the bare-segment redirect. Everything that needs
+         a web stack and therefore cannot live in `events`.
+
+         A DEPLOYABLE APP, not a library jar — <packaging>quarkus</packaging> below is what says so.
+         It serves its own client: src/main/webui is the qits-spa-events submodule, which Quinoa
+         builds into this artifact during augmentation, so one process answers /events/ and
+         /events/api and the gateway needs no second upstream.
+
+         NEVER let quarkus-undertow onto this classpath. Its presence breaks Quinoa's production
+         static serving — the client 404s from a build that was green — and it arrives transitively
+         from anything servlet-shaped. `./mvnw -pl service dependency:tree | grep undertow` before
+         adding a dependency that sounds like a web framework
+         (docs/project-setup-quinoa-angular.md in the qits superproject). -->
+    <artifactId>qits-events-service</artifactId>
+    <name>qits-events :: service</name>
+    <packaging>quarkus</packaging>
+
+    <dependencies>
+        <dependency>
+            <!-- /events/q/health/ready — the readiness endpoint qits-cd's health gate curls; the
+                 deployment convention every service answers. -->
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-smallrye-health</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>${project.groupId}</groupId>
+            <artifactId>qits-events-domain</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-arc</artifactId>
+        </dependency>
+        <dependency>
+            <!-- OTLP export to qits-observability. The extension is what instruments the process;
+                 the endpoint and protocol in application.properties are what make it arrive, since
+                 the defaults are gRPC to localhost:4317 and the receiver speaks HTTP/protobuf. -->
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-opentelemetry</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-rest-jackson</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-hibernate-validator</artifactId>
+        </dependency>
+        <dependency>
+            <!-- The Angular SPA in src/main/webui (a submodule on qits-spa-events' main): Quinoa
+                 runs its npm build during augmentation and registers the output as static
+                 resources. Quinoa is in NO BOM, so the version is pinned — in the ROOT pom's
+                 dependencyManagement, with the reasoning for 2.8.2 beside the property. Its build
+                 needs an npm and a node on PATH; see the note in application.properties. -->
+            <groupId>io.quarkiverse.quinoa</groupId>
+            <artifactId>quarkus-quinoa</artifactId>
+        </dependency>
+        <dependency>
+            <!-- SecurityIdentity plus the HttpAuthenticationMechanism SPI, for the single thing this
+                 service does about auth: read qits-gateway's X-Qits-User header into an identity
+                 (see security/ForwardAuthMechanism). NOT an auth variant and NOT an authorization
+                 policy — authentication terminates at the gateway. -->
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-security</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-smallrye-openapi</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-junit</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.rest-assured</groupId>
+            <artifactId>rest-assured</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <!-- This module is the DEPLOYABLE, not a library jar, and <packaging>quarkus</packaging>
+                     above is what says so: it binds generate-code, generate-code-tests and build into
+                     the lifecycle, so augmentation is not an execution someone can misplace. It was
+                     one in qits-projects — declared under a <build> whose <testResources> block came
+                     first — and that is the arrangement in which the goals silently never applied
+                     while `mvn verify` stayed green. A packaging type cannot fail that way: drop this
+                     <extensions>true</extensions> and the build stops at "Unknown packaging: quarkus"
+                     rather than quietly producing nothing. Version comes from the root pom's
+                     pluginManagement. -->
+                <groupId>${quarkus.platform.group-id}</groupId>
+                <artifactId>quarkus-maven-plugin</artifactId>
+                <extensions>true</extensions>
+            </plugin>
+            <plugin>
+                <artifactId>maven-compiler-plugin</artifactId>
+            </plugin>
+            <plugin>
+                <artifactId>maven-surefire-plugin</artifactId>
+            </plugin>
+            <plugin>
+                <artifactId>maven-failsafe-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>integration-test</goal>
+                            <goal>verify</goal>
+                        </goals>
+                        <configuration>
+                            <systemPropertyVariables>
+                                <!-- How @QuarkusIntegrationTest finds the compiled binary in a
+                                     `-Dnative` build; without it the native run has nothing to
+                                     launch. The binary's name is quarkus.package.output-name in
+                                     application.properties, NOT the maven finalName — with an
+                                     output-name set, ${project.build.finalName}-runner is a path
+                                     that does not exist, so the two have to be spelled the same
+                                     here or a native IT launches nothing and passes. -->
+                                <native.image.path>${project.build.directory}/qits-events</native.image.path>
+                                <!-- The launched artifact takes a FREE port rather than queueing
+                                     for Quarkus' default 8081 — which on the deployment host is
+                                     the platform's own npm registry, and which surefire's
+                                     @QuarkusTest restarts are racing for anyway. The same value is
+                                     set for the unit suite in src/test/resources; the siblings
+                                     (qits-cd, qits-ci, qits-dns) carry this line verbatim. -->
+                                <quarkus.http.test-port>0</quarkus.http.test-port>
+                                <java.util.logging.manager>org.jboss.logmanager.LogManager</java.util.logging.manager>
+                            </systemPropertyVariables>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>io.smallrye</groupId>
+                <artifactId>jandex-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+
+    <profiles>
+        <!-- GraalVM native build (the same profile every qits deployable carries): `-Dnative`
+             disables the fast-jar and enables the native image. It lives in THIS module, not the
+             root pom, because only this module is an application — `events` is a library jar with
+             nothing to native-compile. skipITs flips with it so a native build runs
+             PackagedSurfaceIT against the binary rather than skipping it silently. -->
+        <profile>
+            <id>native</id>
+            <activation>
+                <property>
+                    <name>native</name>
+                </property>
+            </activation>
+            <properties>
+                <quarkus.package.jar.enabled>false</quarkus.package.jar.enabled>
+                <skipITs>false</skipITs>
+                <quarkus.native.enabled>true</quarkus.native.enabled>
+            </properties>
+        </profile>
+    </profiles>
+</project>

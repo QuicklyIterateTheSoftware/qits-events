@@ -1,0 +1,180 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!-- Standalone parent for qits-events — the EVENT context: a recorded thing that happened, with
+         a name, a time and a description, addressable by the platform's other services. Unlike its
+         siblings this repo was not extracted from the monorepo; it starts as a skeleton, and the
+         skeleton is deliberate. What is here is the SHAPE every qits service has (a library-jar
+         domain layer, a deployable `service` that owns the web surface and the client, its own
+         datasource and its own Flyway lineage) with the smallest possible amount of behaviour
+         hanging off it, so that the first real feature is written against a structure that is
+         already right rather than one invented under pressure.
+
+         DELIBERATELY ITS OWN GAV, the same case as qits-ci and qits-projects. The child directories
+         are `events` and `service`, and `eu.wohlben:service` would collide in the shared ~/.m2 that
+         every workspace container mounts. So the coordinates are namespaced
+         (`eu.wohlben.qits:qits-events-*`) while the directories stay short. The `events/` module's
+         artifactId is `qits-events-domain` and not `qits-events-events`, which would be nonsense —
+         the directory names the context, the artifactId names the layer (the qits-ci precedent).
+
+         Versions that must stay in step with the platform (Quarkus, JDK release, MapStruct, Lombok,
+         Quinoa) are duplicated here on purpose: a clone of THIS repo alone must build, with no
+         monorepo and no parent to inherit from. -->
+    <groupId>eu.wohlben.qits</groupId>
+    <artifactId>qits-events</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+    <packaging>pom</packaging>
+    <name>qits-events</name>
+
+    <modules>
+        <!-- Listed first: `service` depends on it. -->
+        <module>events</module>
+        <module>service</module>
+    </modules>
+
+    <properties>
+        <maven.compiler.release>25</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+
+        <quarkus.platform.artifact-id>quarkus-bom</quarkus.platform.artifact-id>
+        <quarkus.platform.group-id>io.quarkus.platform</quarkus.platform.group-id>
+        <quarkus.platform.version>3.34.6</quarkus.platform.version>
+
+        <!-- Quinoa is in NO BOM, so the version is pinned here rather than inherited, and it is
+             pinned in the PARENT rather than beside the dependency so there is one place to read it
+             from when the platform's Quarkus moves. 2.8.2 is the last release built against a
+             Quarkus OLDER than the platform's 3.34.6 (3.27.3 LTS — the compatible direction); 2.8.3
+             is built against 3.36.2, ahead of us. Bump only when the platform's Quarkus passes the
+             version a Quinoa release is built against
+             (docs/project-setup-quinoa-angular.md in the qits superproject). -->
+        <quinoa.version>2.8.2</quinoa.version>
+
+        <compiler-plugin.version>3.15.0</compiler-plugin.version>
+        <surefire-plugin.version>3.5.4</surefire-plugin.version>
+        <failsafe-plugin.version>3.5.4</failsafe-plugin.version>
+        <jandex-plugin.version>3.4.0</jandex-plugin.version>
+        <jar-plugin.version>3.4.2</jar-plugin.version>
+        <lombok.version>1.18.38</lombok.version>
+        <lombok-mapstruct-binding.version>0.2.0</lombok-mapstruct-binding.version>
+        <mapstruct.version>1.6.3</mapstruct.version>
+
+        <!-- PackagedSurfaceIT runs against the BUILT artifact, so it needs a `package` to have
+             happened and — because this service carries a client — a checked-out webui submodule and
+             a node on PATH. A plain `./mvnw verify` on a fresh clone has neither, and the clone-alone
+             rule says it must still be green. `-DskipITs=false` (or `-Dnative`, which flips this in
+             service/pom.xml's profile) is how you ask for the artifact to be probed. -->
+        <skipITs>true</skipITs>
+        <!-- Surefire's @{argLine} has no value unless something (jacoco/quarkus) sets it. -->
+        <argLine/>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>${quarkus.platform.group-id}</groupId>
+                <artifactId>${quarkus.platform.artifact-id}</artifactId>
+                <version>${quarkus.platform.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>org.projectlombok</groupId>
+                <artifactId>lombok</artifactId>
+                <version>${lombok.version}</version>
+                <scope>provided</scope>
+            </dependency>
+            <dependency>
+                <groupId>org.mapstruct</groupId>
+                <artifactId>mapstruct</artifactId>
+                <version>${mapstruct.version}</version>
+            </dependency>
+            <dependency>
+                <!-- The Angular client in service/src/main/webui. See the pin's reasoning at
+                     quinoa.version above; the dependency itself is declared in service/pom.xml. -->
+                <groupId>io.quarkiverse.quinoa</groupId>
+                <artifactId>quarkus-quinoa</artifactId>
+                <version>${quinoa.version}</version>
+            </dependency>
+            <!-- The reactor's own module, so `service` depends on it version-less. -->
+            <dependency>
+                <groupId>${project.groupId}</groupId>
+                <artifactId>qits-events-domain</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <build>
+        <pluginManagement>
+            <plugins>
+                <plugin>
+                    <groupId>${quarkus.platform.group-id}</groupId>
+                    <artifactId>quarkus-maven-plugin</artifactId>
+                    <version>${quarkus.platform.version}</version>
+                </plugin>
+                <plugin>
+                    <artifactId>maven-compiler-plugin</artifactId>
+                    <version>${compiler-plugin.version}</version>
+                    <configuration>
+                        <parameters>true</parameters>
+                        <!-- Incremental compilation leaves stale MapStruct *Impl classes behind
+                             when a mapper's shape changes; the monorepo disables it for the same
+                             reason. -->
+                        <useIncrementalCompilation>false</useIncrementalCompilation>
+                        <annotationProcessorPaths>
+                            <path>
+                                <groupId>org.projectlombok</groupId>
+                                <artifactId>lombok</artifactId>
+                                <version>${lombok.version}</version>
+                            </path>
+                            <path>
+                                <groupId>org.mapstruct</groupId>
+                                <artifactId>mapstruct-processor</artifactId>
+                                <version>${mapstruct.version}</version>
+                            </path>
+                            <path>
+                                <groupId>org.projectlombok</groupId>
+                                <artifactId>lombok-mapstruct-binding</artifactId>
+                                <version>${lombok-mapstruct-binding.version}</version>
+                            </path>
+                        </annotationProcessorPaths>
+                    </configuration>
+                </plugin>
+                <plugin>
+                    <artifactId>maven-surefire-plugin</artifactId>
+                    <version>${surefire-plugin.version}</version>
+                    <configuration>
+                        <systemPropertyVariables>
+                            <java.util.logging.manager>org.jboss.logmanager.LogManager</java.util.logging.manager>
+                        </systemPropertyVariables>
+                    </configuration>
+                </plugin>
+                <plugin>
+                    <artifactId>maven-failsafe-plugin</artifactId>
+                    <version>${failsafe-plugin.version}</version>
+                </plugin>
+                <plugin>
+                    <artifactId>maven-jar-plugin</artifactId>
+                    <version>${jar-plugin.version}</version>
+                </plugin>
+                <plugin>
+                    <groupId>io.smallrye</groupId>
+                    <artifactId>jandex-maven-plugin</artifactId>
+                    <version>${jandex-plugin.version}</version>
+                    <executions>
+                        <execution>
+                            <id>make-index</id>
+                            <goals>
+                                <goal>jandex</goal>
+                            </goals>
+                        </execution>
+                    </executions>
+                </plugin>
+            </plugins>
+        </pluginManagement>
+    </build>
+</project>
