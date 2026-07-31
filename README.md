@@ -13,7 +13,7 @@ of what is here; nothing below describes a plan.
 
 | | |
 |---|---|
-| `Event` | a name, an `occurredAt`, an optional description — plus the row's own `createdAt`/`updatedAt` |
+| `Event` | a name, an `occurredAt`, an optional `payload` and an optional description — plus the row's own `createdAt`/`updatedAt` |
 
 The three timestamps are not redundant. `occurredAt` is the **caller's** — when the thing happened,
 supplied on write and freely in the past, because a log is mostly written after the fact — while
@@ -28,9 +28,10 @@ deployment will name it by **String id** in a column of its own — those rows l
 physical database and no foreign key can span one. That is the platform-wide rule, not a
 this-repo preference.
 
-There is no MCP server here, no websocket and no outbound notifier. Each of those is a *literal*
-route or a *fire-and-forget* seam that the siblings carry because they earned them; adding one here
-means adding its entry to `quarkus.quinoa.ignored-path-prefixes` in the same commit (see below).
+There is no MCP server here. That was true of the websocket too until this service became the
+platform's **bus**, and the sentence is worth keeping in its new form: a literal route is not free.
+`/events/stream` earned its place by being the only way an event can reach anything without being
+polled for, and it cost an entry in `quarkus.quinoa.ignored-path-prefixes` in the same commit.
 
 ## Layout
 
@@ -60,6 +61,7 @@ Everything it serves sits under its gateway segment, `/events`:
 | `/events/` | the Angular SPA, built from `service/src/main/webui` by Quinoa and served by this process (`quarkus.quinoa.ui-root-path`); unmatched paths under it fall back to `index.html`, so the client's own router gets its deep links — except under the prefixes below |
 | `/events` | a 301 to `/events/`. Quinoa mounts at `/events/*`, which does not match the bare segment (upstream quinoa #960); `webui/WebUiRedirect` is this service's answer |
 | `/events/api/events` | the REST surface (`quarkus.rest.path=/events/api`) |
+| `/events/stream` | the event stream socket — a `@WebSocket` literal, which follows `quarkus.rest.path` for nothing and carries the segment itself |
 | `/events/q/openapi`, `/events/q/swagger-ui` | the API document and its UI (`quarkus.http.non-application-root-path`) |
 | `/events/q/health/ready` | the readiness endpoint qits-cd's health gate curls |
 
@@ -70,12 +72,50 @@ The SPA takes the *whole* segment, so it is the one that can swallow the rest: t
 fallback answers anything under `/events` that matched no route, with `200 text/html`. That is right
 for a person and wrong for a machine, which parses `index.html` as garbage data. Quinoa **derives**
 the exclusion list from `quarkus.rest.path` and `quarkus.http.non-application-root-path` when the
-key is unset, and today that derivation would be exactly right — `/api,/q` is this service's whole
-machine surface. It is spelled out anyway, because the derivation is invisible and the first literal
-route added outside those two would silently start answering HTML. Two traps travel with the key:
-setting it **replaces** the derivation rather than extending it (so `/api` and `/q` are repeated by
-hand), and the values are matched **after** `ui-root-path` is stripped, so they are relative —
-`/events/api` written there matches nothing at all and is indistinguishable from not setting the key.
+key is unset, and that derivation *was* exactly right until `/events/stream` existed — a `@WebSocket`
+literal follows neither key. The key had been spelled out before it was needed, which is why adding
+the socket meant adding a line beside it rather than finding out from a subscriber parsing HTML.
+Three traps travel with it: setting it **replaces** the derivation rather than extending it (so
+`/api` and `/q` are repeated by hand); the values are matched **after** `ui-root-path` is stripped,
+so they are relative — `/events/api` written there matches nothing at all and is indistinguishable
+from not setting the key; and websockets-next claims only the **upgrade handshake**, so a plain GET
+on the socket path reaches no socket route and falls through to the SPA unless the prefix is
+ignored. Ignoring it does not unregister the route — the upgrade still works, and
+`PackagedSurfaceIT` asserts both halves on the built artifact.
+
+## The bus
+
+Two things make this an event *bus* rather than an event *log*:
+
+    PUT /events/api/events/{id}    idempotent publish under the publisher's own UUID
+    ws:  /events/stream            live push of every newly created event
+
+The envelope is one shape in both directions:
+
+```json
+{ "name": "BuildSuccessful",
+  "occurredAt": "2026-07-31T12:46:03Z",
+  "payload": "{\"branch\":\"main\",\"repoId\":\"qits-ci\"}",
+  "description": null }
+```
+
+`payload` is the publishing event class's own fields as **canonical JSON in a string**. This service
+stores and compares it verbatim and never reformats it: canonicalization is the publisher's job, and
+the equality below is the only reason a retry is safe.
+
+The publish has three answers and no fourth — `201` for an id this log has not seen, `200` for the
+same `name`/`occurredAt`/`payload` arriving again (nothing written, nothing pushed), `400` for an id
+that exists with anything different, which is a reused UUID and not something a retry fixes.
+`description` is deliberately outside that comparison: it is the human account, not part of the
+event's identity. `POST /events/api/events` stays what it was, for recording something by hand.
+
+A subscriber connects to `/events/stream` and sends one frame — `{"subscribe": ["BuildSuccessful"]}`,
+which *replaces* that connection's set; `["*"]` means everything — and is then pushed
+`{"id", "name", "occurredAt", "payload", "description"}` for each newly created matching event.
+`name` doubles as the **signature** a subscriber matches on. Live only, at-most-once: no replay, no
+offset, no catch-up. That is a deliberate omission rather than a gap — catch-up reads the event log
+itself and is a separate feature — and the envelope carries the id precisely so it can be built
+without breaking anyone.
 
 ## The client
 
@@ -91,7 +131,7 @@ That gives this repo a clone rule with two halves:
     git clone … && git submodule update --init
 
 - **The test suite needs neither node nor the submodule.** Quinoa is disabled by default in test
-  mode (`Quinoa is disabled by default in tests.`), so all 21 `@QuarkusTest`s are green against an
+  mode (`Quinoa is disabled by default in tests.`), so all 45 `@QuarkusTest`s are green against an
   empty `webui/` on a machine with no node at all — `./mvnw test`, measured.
 - **Anything that reaches `package` needs both**, and that includes `./mvnw verify`, which runs
   `package` on its way to failsafe. An uninitialised gitlink is an *empty directory*, and that is

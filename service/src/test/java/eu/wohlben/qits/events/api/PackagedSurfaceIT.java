@@ -2,16 +2,22 @@ package eu.wohlben.qits.events.api;
 
 import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import eu.wohlben.qits.events.stream.FakeSubscriber;
+import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusIntegrationTest;
 import io.quarkus.test.junit.QuarkusTestProfile;
 import io.quarkus.test.junit.TestProfile;
 import io.restassured.http.ContentType;
+import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.Comparator;
 import java.util.Map;
+import java.util.UUID;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -37,6 +43,12 @@ import org.junit.jupiter.api.Test;
  *       <b>never</b> {@code text/html}. A machine client parses {@code index.html} as data, so the
  *       content type is as much of the assertion as the status.
  *   <li>the readiness endpoint qits-cd's health gate curls, at the address the deployment assumes
+ *   <li>{@code /events/stream}: a plain GET → 404 and not the client, and the upgrade → a working
+ *       socket. Two probes rather than one, because they fail for opposite reasons —
+ *       websockets-next claims only the <em>handshake</em>, so the plain GET is the Quinoa question
+ *       and the upgrade is the "did the endpoint survive augmentation and the native image?"
+ *       question. qits-ci learned the first by measuring it: before the prefix was ignored, a plain
+ *       GET on its daemon socket answered 200 {@code index.html} from a green build.
  * </ul>
  *
  * <p>ITs are skipped by default ({@code skipITs} in the root pom) because they need a `package`, and
@@ -63,6 +75,14 @@ public class PackagedSurfaceIT {
       return Map.of("user.home", HOME.toString());
     }
   }
+
+  /**
+   * The socket's absolute literal. {@code /events/stream} does not follow {@code quarkus.rest.path}
+   * — it carries the segment itself — and it is the address a publisher's config derives, so it is
+   * spelled here in full rather than built from a relative one.
+   */
+  @TestHTTPResource("/events/stream")
+  URI stream;
 
   @Test
   public void theClientIsServedAtTheSegmentWithItsOwnBaseHref() {
@@ -180,6 +200,107 @@ public class PackagedSurfaceIT {
     assertTrue(
         Files.isDirectory(PackagedUnderTarget.HOME.resolve(".qits/data/events/h2")),
         "the shipped file-H2 default must be what the packaged process opened");
+  }
+
+  @Test
+  public void aPlainGetOnTheSocketPathIsFourOhFourAndNeverTheClient() {
+    // websockets-next claims the UPGRADE and nothing else, so a GET with no Upgrade header reaches
+    // no socket route at all and — without /stream in quarkus.quinoa.ignored-path-prefixes — falls
+    // through to the SPA's catch-all and answers 200 index.html. Measured exactly that way on
+    // qits-ci's /ci/daemon. A subscriber handed a web page parses it as data; 404 is the answer.
+    //
+    // As everywhere else here the assertion is "404, and not the CLIENT" rather than "404, never
+    // HTML": what actually comes back is Vert.x' own stock <h1>Resource not found</h1>, which is
+    // text/html and correct, so the absence of the client is what is pinned.
+    String body = given().when().get("/events/stream").then().statusCode(404).extract().asString();
+    assertFalse(
+        body.contains("<base href=\"/events/\">"),
+        "the stream path must not be answered with the client; got: " + body);
+
+    String mistyped =
+        given().when().get("/events/stream/nope").then().statusCode(404).extract().asString();
+    assertFalse(mistyped.contains("<base href=\"/events/\">"));
+  }
+
+  @Test
+  public void theStreamIsOnTheArtifactsRouterAndPushesWhatThePublishWrote() throws Exception {
+    // Ignoring a prefix stops the SPA REROUTE; it does not unregister the real route. That is the
+    // half of the previous test's arrangement that only a real upgrade can prove — and the endpoint
+    // is registered at AUGMENTATION, so under -Dnative this is where "the extension is
+    // native-image supported" stops being a claim. A dropped route fails the upgrade with a 404
+    // instead, and every subscriber would otherwise see only a stream that never says anything.
+    String signature = "PackagedProbe" + System.nanoTime();
+    String envelope =
+        "{\"name\":\""
+            + signature
+            + "\",\"occurredAt\":\"2026-07-31T12:46:03Z\",\"payload\":\"{\\\"probe\\\":true}\","
+            + "\"description\":null}";
+
+    try (FakeSubscriber subscriber = FakeSubscriber.dial(stream)) {
+      subscriber.subscribe(signature);
+      // The protocol has no ack and there is no bean to inspect from out here — the app under test
+      // is another process. So a fresh event is published until one of them lands as a frame: each
+      // attempt is its own UUID and therefore its own create, and a create is what pushes.
+      String frame = null;
+      long deadline = System.nanoTime() + Duration.ofSeconds(20).toNanos();
+      while (frame == null && System.nanoTime() < deadline) {
+        given()
+            .contentType(ContentType.JSON)
+            .body(envelope)
+            .when()
+            .put("/events/api/events/" + UUID.randomUUID())
+            .then()
+            .statusCode(201);
+        frame = subscriber.next(Duration.ofSeconds(2));
+      }
+      assertNotNull(frame, "the packaged artifact's stream pushed nothing");
+      assertTrue(frame.contains("\"name\":\"" + signature + "\""), frame);
+      assertTrue(frame.contains("\"payload\":\"{\\\"probe\\\":true}\""), frame);
+    }
+  }
+
+  @Test
+  public void theIdempotentPublishAnswersTwoOhOneThenTwoHundredThenFourHundred() {
+    // On the artifact rather than only in a @QuarkusTest, because this is also the only place the
+    // V2 payload column is exercised against the SHIPPED file-H2 through Flyway's real migration
+    // resources — the shape a native image drops silently.
+    String id = UUID.randomUUID().toString();
+    String envelope =
+        "{\"name\":\"PackagedPublish\",\"occurredAt\":\"2026-07-31T12:46:03Z\","
+            + "\"payload\":\"{\\\"repoId\\\":\\\"qits-events\\\"}\",\"description\":null}";
+
+    given()
+        .contentType(ContentType.JSON)
+        .body(envelope)
+        .when()
+        .put("/events/api/events/" + id)
+        .then()
+        .statusCode(201)
+        .body("event.payload", org.hamcrest.Matchers.equalTo("{\"repoId\":\"qits-events\"}"));
+
+    given()
+        .contentType(ContentType.JSON)
+        .body(envelope)
+        .when()
+        .put("/events/api/events/" + id)
+        .then()
+        .statusCode(200);
+
+    given()
+        .contentType(ContentType.JSON)
+        .body(envelope.replace("qits-events\\\"}", "somebody-else\\\"}"))
+        .when()
+        .put("/events/api/events/" + id)
+        .then()
+        .statusCode(400);
+
+    given()
+        .contentType(ContentType.JSON)
+        .body(envelope)
+        .when()
+        .put("/events/api/events/not-a-uuid")
+        .then()
+        .statusCode(400);
   }
 
   private static void deleteRecursively(Path root) {

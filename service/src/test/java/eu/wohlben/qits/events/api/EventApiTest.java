@@ -4,6 +4,7 @@ import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.notNullValue;
+import static org.hamcrest.Matchers.nullValue;
 
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.http.ContentType;
@@ -15,16 +16,19 @@ import org.junit.jupiter.api.Test;
  * REST round-trips for the events boundary. The addresses are the shipped ones — the suite inherits
  * {@code quarkus.rest.path=/events/api} from main's application.properties rather than re-declaring
  * it — so a change to the segment fails here rather than in a deployment.
+ *
+ * <p>The manual {@code POST} path only. The publisher's {@code PUT} is a different operation with
+ * different semantics and lives in {@link EventPublishApiTest}.
  */
 @QuarkusTest
 class EventApiTest {
 
-  private String create(String name, String occurredAt, String description) {
+  private String create(String name, String occurredAt, String payload, String description) {
     return given()
         .contentType(ContentType.JSON)
         .body(
             new EventController.CreateEventRequest(
-                name, occurredAt == null ? null : Instant.parse(occurredAt), description))
+                name, occurredAt == null ? null : Instant.parse(occurredAt), payload, description))
         .when()
         .post("/events/api/events")
         .then()
@@ -35,8 +39,9 @@ class EventApiTest {
   }
 
   @Test
-  void fullEventLifecycle() {
-    String id = create("Deployed qits-events", "2026-07-31T09:00:00Z", "First boot");
+  void createReadDelete() {
+    String id =
+        create("Deployed qits-events", "2026-07-31T09:00:00Z", "{\"host\":\"one\"}", "First boot");
 
     given()
         .when()
@@ -45,19 +50,8 @@ class EventApiTest {
         .statusCode(200)
         .body("event.name", equalTo("Deployed qits-events"))
         .body("event.occurredAt", equalTo("2026-07-31T09:00:00Z"))
+        .body("event.payload", equalTo("{\"host\":\"one\"}"))
         .body("event.description", equalTo("First boot"));
-
-    given()
-        .contentType(ContentType.JSON)
-        .body(
-            new EventController.UpdateEventRequest(
-                "Deployed qits-events v2", Instant.parse("2026-08-01T09:00:00Z"), null))
-        .when()
-        .put("/events/api/events/" + id)
-        .then()
-        .statusCode(200)
-        .body("event.name", equalTo("Deployed qits-events v2"))
-        .body("event.occurredAt", equalTo("2026-08-01T09:00:00Z"));
 
     given()
         .when()
@@ -70,11 +64,22 @@ class EventApiTest {
   }
 
   @Test
+  void aHandRecordedEventNeedsNoPayload() {
+    String id = create("By hand", "2026-07-31T09:00:00Z", null, null);
+    given()
+        .when()
+        .get("/events/api/events/" + id)
+        .then()
+        .statusCode(200)
+        .body("event.payload", nullValue());
+  }
+
+  @Test
   void theListIsNewestFirstByWhenItHappened() {
     String prefix = "list-" + System.nanoTime() + "-";
-    create(prefix + "middle", "2026-06-01T00:00:00Z", null);
-    create(prefix + "oldest", "2026-01-01T00:00:00Z", null);
-    create(prefix + "newest", "2026-12-01T00:00:00Z", null);
+    create(prefix + "middle", "2026-06-01T00:00:00Z", null, null);
+    create(prefix + "oldest", "2026-01-01T00:00:00Z", null, null);
+    create(prefix + "newest", "2026-12-01T00:00:00Z", null, null);
 
     given()
         .when()

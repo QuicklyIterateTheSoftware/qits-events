@@ -1,0 +1,17 @@
+-- The machine half of an event, added when this context stopped being only a log and became the
+-- platform's bus: `payload` is the publishing event class's own fields, as canonical JSON.
+--
+-- It does NOT replace `description`, and the two are not two spellings of one thing: description is
+-- the human account, written for a person reading a timeline, while payload is the structured facts
+-- a subscriber acts on. `name` doubles as the event's SIGNATURE — the string a subscriber matches
+-- its interest against — which is why nothing new is needed for routing.
+--
+-- NULLABLE, and permanently so: every row written before this migration has no payload, and the
+-- manual POST path still records events that are honestly nothing but a name and a time.
+--
+-- clob rather than varchar(n): no length a schema could pick here would be anything but a guess,
+-- and the column is never queried by content. The server treats the string as opaque — it stores
+-- what the publisher canonicalized, compares it byte for byte when a PUT replays an id it already
+-- has, and hands it back verbatim. Canonicalization belongs to the publisher, so a server that
+-- reformatted this value would break exactly the equality the idempotent PUT is built on.
+alter table Event add column payload clob;

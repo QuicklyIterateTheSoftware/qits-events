@@ -14,8 +14,9 @@ inheriting them, and why every suite runs on in-memory H2.
 right because the platform reference states it loosely:
 
 - `./mvnw test` — needs **neither node nor the webui submodule**. Quinoa is disabled by default in
-  test mode (it says so: `Quinoa is disabled by default in tests.`), so all 21 `@QuarkusTest`s pass
-  against an empty `webui/` on a machine with no node at all. Measured, not assumed.
+  test mode (it says so: `Quinoa is disabled by default in tests.`), so all 45 `@QuarkusTest`s pass
+  against an empty `webui/` on a machine with no node at all — the stream socket included, since
+  a websocket is not a Quinoa concern. Measured, not assumed.
 - `./mvnw verify` — runs `package` on its way to failsafe, and `package` is where Quinoa augments.
   So verify needs **both**, and against an uninitialised submodule it fails with
   `No package.json found in Web UI directory: 'src/main/webui'`. `docs/project-setup-quinoa-angular.md`
@@ -51,7 +52,11 @@ its siblings use, so the file is recognisable across repos):
   sense that matters: no JAX-RS. Entities are Panache active-record with public fields; mappers are
   MapStruct `@Mapper(componentModel = "jakarta")`; errors carry an HTTP status code so the web layer
   can map them without this module knowing what HTTP is.
-- `service/` — `api` (JAX-RS + the exception mapper), `security` (the header-reading mechanism).
+- `service/` — `api` (JAX-RS + the exception mapper), `security` (the header-reading mechanism),
+  `stream` (the event stream socket and the table of who is subscribed to what). `stream` sits here
+  rather than in `events/` for the same reason `api` does — it needs a web stack — and it is split
+  socket/registry the way qits-ci splits `CiDaemonSocket` from `CiDaemonRegistry`: the socket owns
+  the lifecycle and the framing, the registry owns the subscription table and the fan-out.
 - `webui/` — `WebUiRedirect`, and only that.
 
 `control/` is flat and stays flat.
@@ -81,7 +86,11 @@ facts about that key, all measured on sibling services:
   unset — the failure that hides.
 - `@WebSocket` and anything registered straight onto the Vert.x router do **not** follow
   `quarkus.rest.path`; they take a literal path and need their own entry. websockets-next claims
-  only the upgrade handshake, so a plain GET on a socket path falls through to the SPA.
+  only the upgrade handshake, so a plain GET on a socket path falls through to the SPA. That is why
+  the key reads `/api,/q,/stream` today: `EventStreamSocket` is `@WebSocket(path = "/events/stream")`
+  and the `/stream` entry landed in the same commit. Ignoring a prefix stops the SPA *reroute* and
+  does not unregister the route — the upgrade still works, and `PackagedSurfaceIT` asserts both
+  halves, because both are invisible to a `@QuarkusTest`.
 
 The segment itself is spelled in **four** places that move together: `quarkus.quinoa.ui-root-path`,
 `quarkus.rest.path`, `quarkus.http.non-application-root-path`, and the client's `baseHref` in
@@ -115,6 +124,35 @@ annotation went on passing the whole time.
 Do not lift `events/security` into a shared `libs/qits-auth`. Every repo builds from a clone of
 itself alone, so ~115 lines duplicated per service is cheaper than a jar that has to travel to all of
 them; the duplication is the decision, not an oversight.
+
+## The bus
+
+`PUT /events/api/events/{id}` and `/events/stream` are the two surfaces that make this a bus rather
+than a log, and the wire contract for both is frozen in `eventsourcing-plan.md` in the superproject.
+Three things about it are load-bearing here:
+
+- **`payload` is stored and compared verbatim.** It arrives as canonical JSON *inside a string*.
+  Canonicalization happens in the publisher (qits-ci's `qits-eventsourcing` module); a server that
+  reformatted the value — pretty-printing it, reordering keys, parsing and re-serializing it — would
+  break the byte-for-byte equality the idempotent PUT rests on, and the break would look like
+  "publishers keep getting 400 on their own retries".
+- **The comparison is `name` + `occurredAt` + `payload`, and `description` is outside it** on
+  purpose: the human account is not part of an event's identity. `occurredAt` is truncated to
+  microseconds on the way in, because the column is `timestamp(6)` and comparing the caller's
+  nanoseconds against the database's microseconds would 400 a publisher's honest retry.
+- **Only a *create* broadcasts.** A 200 replay pushes nothing — a subscriber must not see an event
+  twice because a network dropped an acknowledgement. That is why the CDI signal is named
+  `EventCreated`, fired from `EventService` (so both write paths cannot diverge about it) and
+  observed `AFTER_SUCCESS` (so a rollback pushes nothing).
+
+`EventCreated` carries `@RegisterForReflection`: it is serialized by Jackson directly rather than as
+a JAX-RS return type, so nothing else tells the native-image builder its accessors are reachable. Without
+it the JVM suite stays green and the binary pushes `{}`.
+
+The fan-out never blocks and never throws upwards. It runs on the thread that completed the create's
+transaction, so `sendTextAndAwait` — which is `sendText(…).await().indefinitely()` under a friendlier
+name, the shape qits-ci banned by name — would let one dead subscriber hold a committed write's
+thread forever. One broken socket costs its own frame and nothing else.
 
 ## Schema changes
 

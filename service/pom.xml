@@ -57,6 +57,22 @@
             <artifactId>quarkus-rest-jackson</artifactId>
         </dependency>
         <dependency>
+            <!-- /events/stream — the way out of the event log (stream/EventStreamSocket). Version
+                 from the platform BOM, the same extension and the same version qits-ci carries for
+                 its daemon control socket.
+
+                 It brings no servlet stack with it (quarkus-vertx-http is the whole of what it
+                 needs), which is the thing to check before adding anything web-shaped here:
+                 `./mvnw -pl service -am dependency:tree | grep -i undertow` must stay empty.
+
+                 It registers its endpoint at AUGMENTATION and claims only the upgrade handshake —
+                 both facts are load-bearing. The first is why PackagedSurfaceIT dials the packaged
+                 artifact rather than trusting the JVM suite; the second is why /stream had to join
+                 quarkus.quinoa.ignored-path-prefixes in the same commit. -->
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-websockets-next</artifactId>
+        </dependency>
+        <dependency>
             <groupId>io.quarkus</groupId>
             <artifactId>quarkus-hibernate-validator</artifactId>
         </dependency>
