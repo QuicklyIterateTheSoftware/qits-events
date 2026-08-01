@@ -1,0 +1,27 @@
+-- The log grew filters and a cursor, so it grew the one index those filters need and no more.
+--
+-- What the existing indexes already cover, and why they are not enough on their own:
+--   idx_event_occurred_at (V1)  the unfiltered page, the `since` floor and the cursor predicate —
+--                               all of them are ranges over occurred_at, read newest first.
+--   idx_event_parent_id   (V3)  the chain walk downwards, one query per hop.
+--
+-- What neither covers is `where name in (…) order by occurred_at desc`: with the single-column
+-- index the database either scans the table for the names and sorts what it finds, or walks
+-- occurred_at from the head discarding rows until the page fills — and the second is worst exactly
+-- when the filter is most useful, because a name with few rows is a long walk. The composite gives
+-- the ordered rows of one name directly, and `in` is that read once per name.
+--
+-- Leading with `name` rather than with `occurred_at` is the whole design of it: equality first,
+-- range second. The reverse order would be the V1 index with a column stapled on.
+create index idx_event_name_occurred_at on Event (name, occurred_at);
+
+-- `?q=` gets NO index, and that is a decision rather than an omission. It is a substring match on
+-- the payload clob — `lower(payload) like '%…%'` — and a leading wildcard cannot use an index at
+-- all, so the only thing that would help is a full-text index over a column this service defines as
+-- opaque and never parses (V2__payload.sql). Measured instead of assumed: the log took 137 rows in
+-- its first day, peaking at 27 in an hour, which is about 50,000 rows and 22 MB a year. Scanning
+-- that for a search a person types by hand is honest. Revisit it when the number is different, not
+-- when the query looks slow in the abstract.
+--
+-- No index on `id` beyond the primary key either: the cursor's tiebreaker reads
+-- `occurred_at = ? and id < ?`, which is a handful of rows sharing one microsecond.

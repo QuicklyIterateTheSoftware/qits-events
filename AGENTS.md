@@ -14,7 +14,7 @@ inheriting them, and why every suite runs on in-memory H2.
 right because the platform reference states it loosely:
 
 - `./mvnw test` — needs **neither node nor the webui submodule**. Quinoa is disabled by default in
-  test mode (it says so: `Quinoa is disabled by default in tests.`), so all 64 `@QuarkusTest`s pass
+  test mode (it says so: `Quinoa is disabled by default in tests.`), so all 84 `@QuarkusTest`s pass
   against an empty `webui/` on a machine with no node at all — the stream socket included, since
   a websocket is not a Quinoa concern. Measured, not assumed.
 - `./mvnw verify` — runs `package` on its way to failsafe, and `package` is where Quinoa augments.
@@ -183,6 +183,37 @@ The fan-out never blocks and never throws upwards. It runs on the thread that co
 transaction, so `sendTextAndAwait` — which is `sendText(…).await().indefinitely()` under a friendlier
 name, the shape qits-ci banned by name — would let one dead subscriber hold a committed write's
 thread forever. One broken socket costs its own frame and nothing else.
+
+## Reading the log
+
+The list route pages, and two of its properties are easy to undo by accident:
+
+- **The sort is `(occurredAt desc, id desc)` and the id half is not decoration.** `occurredAt` is not
+  unique and cannot be made unique — a pipeline run's events carry the run's finish instant, so a
+  fork's siblings tie to the microsecond by construction. Dropping the tiebreaker makes two identical
+  requests disagree about the order of a tied pair and makes every cursor over the list lossy.
+  `EventRepository.NEWEST_FIRST` is the one sort, and `listChildrenOf` uses it too: a fork's children
+  are the exact rows that tie.
+- **The cursor is composite for that reason.** `?cursor=<occurredAt>,<id>`, predicate
+  `occurred_at < :at or (occurred_at = :at and id < :id)`. A scalar `before=<occurredAt>` is the
+  obvious shape and it splits a fork across a page boundary — it either repeats a sibling or drops
+  one. If a future change makes the pair look like ceremony, read `EventCursor`.
+
+`EventQuery` parses every filter, and the boundary hands it the caller's **text**: `limit`, `since`,
+`q`, `cursor` and `name` are all `String` `@QueryParam`s. That is deliberate — one place decides what
+a bad value means and every bad value is a 400 whose message names the parameter, where a JAX-RS
+parameter converter answers 404 for a query parameter it cannot convert, with no body worth reading.
+Blank is absent throughout, the rule `?parentId=` already followed.
+
+`?q=` is a substring of the payload and **parses nothing**. The payload is opaque here — that is what
+makes the idempotent publish's byte-for-byte comparison true — and there is no single key meaning
+"which repository" to project anyway (`repoId` on a build, `repository` on a release). A projected
+column is the thing to refuse first if someone wants exactness.
+
+`GET /events/api/events/names` is a literal beside the `/{id}` template. JAX-RS sorts literal
+characters ahead of a template so it wins, but that is a spec guarantee being leaned on, so
+`EventApiTest` and `PackagedSurfaceIT` both assert it. Everything here stays under `/events/api`, so
+`quarkus.quinoa.ignored-path-prefixes` is untouched — check that again before adding a route.
 
 ## Schema changes
 

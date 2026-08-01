@@ -157,6 +157,77 @@ public class PackagedSurfaceIT {
   }
 
   @Test
+  public void theVocabularyRouteAnswersJsonAndNotTheClient() {
+    // /events/api/events/names is a literal beside the /{id} template, and it is the newest place
+    // the two ways this can go wrong meet: JAX-RS could match the template (404, "Event not found:
+    // names") or — if /api ever left quarkus.quinoa.ignored-path-prefixes — Quinoa's catch-all could
+    // answer 200 index.html, which a filter's dropdown would parse as data. Both are invisible to a
+    // @QuarkusTest, where Quinoa is disabled and there is no client at all.
+    given()
+        .contentType(ContentType.JSON)
+        .body("{\"name\":\"PackagedVocabulary\",\"occurredAt\":\"2026-07-31T09:00:00Z\"}")
+        .when()
+        .post("/events/api/events")
+        .then()
+        .statusCode(200);
+
+    given()
+        .when()
+        .get("/events/api/events/names")
+        .then()
+        .statusCode(200)
+        .contentType(ContentType.JSON)
+        .body("names", org.hamcrest.Matchers.hasItem("PackagedVocabulary"));
+  }
+
+  @Test
+  public void aPageOfTheLogStopsAtTheLimitAndSaysWhereToResume() {
+    // On the artifact because the page is a Flyway-migrated index away from being a scan, and
+    // because `nextCursor` is the one field the SPA's "load more" is built on: an omit-nulls mapper
+    // or a dropped record component would leave a client unable to tell "no more" from "no field".
+    String mark = "packaged-page-" + System.nanoTime();
+    for (int i = 1; i <= 3; i++) {
+      given()
+          .contentType(ContentType.JSON)
+          .body(
+              "{\"name\":\"PackagedPage\",\"occurredAt\":\"2026-0"
+                  + i
+                  + "-01T00:00:00Z\",\"payload\":\"{\\\"mark\\\":\\\""
+                  + mark
+                  + "\\\"}\"}")
+          .when()
+          .post("/events/api/events")
+          .then()
+          .statusCode(200);
+    }
+
+    String cursor =
+        given()
+            .queryParam("q", mark)
+            .queryParam("limit", 2)
+            .when()
+            .get("/events/api/events")
+            .then()
+            .statusCode(200)
+            .body("events", org.hamcrest.Matchers.hasSize(2))
+            .body("nextCursor", org.hamcrest.Matchers.notNullValue())
+            .extract()
+            .path("nextCursor");
+
+    given()
+        .queryParam("q", mark)
+        .queryParam("limit", 2)
+        .queryParam("cursor", cursor)
+        .when()
+        .get("/events/api/events")
+        .then()
+        .statusCode(200)
+        .body("events", org.hamcrest.Matchers.hasSize(1))
+        .body("$", org.hamcrest.Matchers.hasKey("nextCursor"))
+        .body("nextCursor", org.hamcrest.Matchers.nullValue());
+  }
+
+  @Test
   public void theReadinessEndpointIsWhereTheDeploymentLooksForIt() {
     given()
         .when()

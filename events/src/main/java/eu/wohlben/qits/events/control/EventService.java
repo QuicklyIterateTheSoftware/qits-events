@@ -50,8 +50,43 @@ public class EventService {
   /** The stored event plus what happened to it. */
   public record Published(Event event, PublishOutcome outcome) {}
 
+  /**
+   * One page of the log and where the next one starts, or {@code null} when this was the last page.
+   *
+   * <p>The cursor is <b>the page's own last row</b> rather than a token this service remembers:
+   * nothing is stored, nothing expires, and a client that keeps a cursor for a week resumes exactly
+   * where it stopped. An append-only log makes that safe — rows arrive at the head, and a walk
+   * downwards can only be overtaken, never invalidated.
+   */
+  public record EventPage(List<Event> events, EventCursor nextCursor) {}
+
+  /**
+   * One page of the log, newest first.
+   *
+   * <p>The repository is asked for one row more than the page holds. If it comes back, there is more
+   * history and the page's last row becomes the next cursor; if it does not, the client has reached
+   * the end and gets {@code null} — which is the only thing it has to check, and it never has to
+   * infer the answer from a page that happened to come back full.
+   */
+  public EventPage list(EventQuery query) {
+    List<Event> rows = eventRepository.listPage(query);
+    boolean more = rows.size() > query.limit();
+    List<Event> page = List.copyOf(more ? rows.subList(0, query.limit()) : rows);
+    if (!more || page.isEmpty()) {
+      return new EventPage(page, null);
+    }
+    Event last = page.get(page.size() - 1);
+    return new EventPage(page, new EventCursor(last.occurredAt, last.id));
+  }
+
+  /** The first page at the default size — the whole log, while the log is smaller than a page. */
   public List<Event> list() {
-    return eventRepository.listNewestFirst();
+    return list(EventQuery.defaults()).events();
+  }
+
+  /** Every name the log holds, once each, alphabetically — the filter's and the bus's vocabulary. */
+  public List<String> names() {
+    return eventRepository.distinctNames();
   }
 
   /**

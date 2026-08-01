@@ -1,7 +1,9 @@
 package eu.wohlben.qits.events.api;
 
+import eu.wohlben.qits.events.control.EventQuery;
 import eu.wohlben.qits.events.control.EventService;
 import eu.wohlben.qits.events.dto.EventDto;
+import eu.wohlben.qits.events.entity.Event;
 import eu.wohlben.qits.events.mapper.EventMapper;
 import jakarta.inject.Inject;
 import jakarta.validation.Valid;
@@ -47,32 +49,93 @@ public class EventController {
 
   @Inject EventMapper eventMapper;
 
+  /**
+   * A page of the log, and where the next one resumes.
+   *
+   * <p>{@code nextCursor} is {@code null} on the last page, and that is the only end-of-log signal a
+   * client needs — a full page is not one, and a count would be a second question this route
+   * deliberately does not answer. The field was <em>appended</em> to a shape that already shipped,
+   * so a consumer that never reads it goes on reading the list it always read.
+   */
   public record ListEventsRequest() {
-    public record Response(List<EventDto> events) {}
+    public record Response(List<EventDto> events, String nextCursor) {}
   }
 
   /**
-   * The log, newest first — and, with {@code ?parentId=<id>}, the events that <em>one</em> event
-   * caused, which is the downward half of a chain walk.
+   * The log, newest first, one page at a time — and, with {@code ?parentId=<id>}, the events that
+   * <em>one</em> event caused, which is the downward half of a chain walk.
    *
-   * <p>A query parameter on the route that already exists rather than a route of its own, and that
-   * is not only economy: a new literal under {@code /events} would need an entry in {@code
-   * quarkus.quinoa.ignored-path-prefixes} in the same commit, which is this platform's standing
-   * trap. A parameter needs none, so this feature does not touch that key at all.
+   * <p>Every filter is a query parameter on the route that already exists rather than a route of its
+   * own, and that is not only economy: a new literal under {@code /events} would need an entry in
+   * {@code quarkus.quinoa.ignored-path-prefixes} in the same commit, which is this platform's
+   * standing trap. Parameters need none, so none of this touches that key.
    *
-   * <p>An unknown parent gives an empty list, not a 404 — see {@code EventService.listChildrenOf}.
-   * Blank is treated as absent: {@code ?parentId=} is a client that meant to ask for everything.
-   * There is deliberately no chain, depth or root endpoint; upwards is {@code GET /{id}} following
-   * {@code parentId}, downwards is this, and a client that walks either <b>must bound its own depth
-   * and remember the ids it has seen</b>, because nothing here prevents a cycle.
+   * <ul>
+   *   <li>{@code ?limit=} — page size. Absent is 200, above 1000 is 1000, and anything that is not a
+   *       whole number at least 1 is a 400. It was silently <em>unknown</em> before this — the
+   *       method declared {@code parentId} alone, so JAX-RS dropped it and answered with all of
+   *       history while the client believed it had asked for ten rows.
+   *   <li>{@code ?cursor=<occurredAt>,<id>} — resume after the previous page's last row. Composite
+   *       because {@code occurredAt} ties; see {@code EventCursor}.
+   *   <li>{@code ?name=A,B} — the same vocabulary the stream's subscribe frame uses, so a filter
+   *       means one thing live and historically. {@code GET /events/names} lists it.
+   *   <li>{@code ?since=} — an inclusive lower bound on {@code occurredAt}. There is no upper bound
+   *       parameter; the cursor is the upper bound.
+   *   <li>{@code ?q=} — a case-insensitive substring of the payload, which this service stores and
+   *       hands back as an opaque string and does not parse here either.
+   * </ul>
+   *
+   * <p><b>{@code ?parentId=} is answered whole and takes none of them.</b> A parent's children are
+   * one per artifact a pipeline declares — bounded by a file in a repository, not by history — so
+   * paging them would be a parameter that never fires, and {@code nextCursor} is null on that
+   * answer. An unknown parent gives an empty list, not a 404; blank is treated as absent, so {@code
+   * ?parentId=} is a client that meant to ask for everything.
+   *
+   * <p>There is deliberately no chain, depth or root endpoint; upwards is {@code GET /{id}}
+   * following {@code parentId}, downwards is this, and a client that walks either <b>must bound its
+   * own depth and remember the ids it has seen</b>, because nothing here prevents a cycle.
    */
   @GET
-  public ListEventsRequest.Response list(@QueryParam("parentId") String parentId) {
-    var events =
-        parentId == null || parentId.isBlank()
-            ? eventService.list()
-            : eventService.listChildrenOf(parentId);
-    return new ListEventsRequest.Response(events.stream().map(eventMapper::toDto).toList());
+  public ListEventsRequest.Response list(
+      @QueryParam("parentId") String parentId,
+      @QueryParam("name") String name,
+      @QueryParam("since") String since,
+      @QueryParam("q") String q,
+      @QueryParam("cursor") String cursor,
+      @QueryParam("limit") String limit) {
+    if (parentId != null && !parentId.isBlank()) {
+      return new ListEventsRequest.Response(toDtos(eventService.listChildrenOf(parentId)), null);
+    }
+    var page = eventService.list(EventQuery.of(name, since, q, cursor, limit));
+    return new ListEventsRequest.Response(
+        toDtos(page.events()),
+        page.nextCursor() == null ? null : page.nextCursor().format());
+  }
+
+  public record ListEventNamesRequest() {
+    public record Response(List<String> names) {}
+  }
+
+  /**
+   * The names the log holds, once each, alphabetically — what a filter can offer and what a
+   * subscriber may name in its subscribe frame.
+   *
+   * <p><b>It is a literal beside a template, and the order they are matched in is the hazard.</b>
+   * {@code /names} and {@code /{id}} are siblings under this class's {@code @Path}, and JAX-RS sorts
+   * literal characters ahead of a template — so {@code /events/api/events/names} reaches this method
+   * and not {@code get("names")}, which would be a 404 for an event nobody recorded. That is a spec
+   * guarantee being leaned on rather than a local arrangement, so {@code EventApiTest} asserts it;
+   * if it ever stops holding, a second controller at {@code /event-names} settles the question with
+   * no ordering in it at all.
+   */
+  @GET
+  @Path("/names")
+  public ListEventNamesRequest.Response names() {
+    return new ListEventNamesRequest.Response(eventService.names());
+  }
+
+  private List<EventDto> toDtos(List<Event> events) {
+    return events.stream().map(eventMapper::toDto).toList();
   }
 
   public record GetEventRequest() {

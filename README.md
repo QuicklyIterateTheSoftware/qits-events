@@ -19,7 +19,8 @@ The three timestamps are not redundant. `occurredAt` is the **caller's** — whe
 supplied on write and freely in the past, because a log is mostly written after the fact — while
 `createdAt`/`updatedAt` are the row's, written by Hibernate. Collapse them and a backfilled event
 becomes indistinguishable from one recorded as it happened, which is the one distinction an event
-log exists to keep. Listing is ordered by `occurredAt`, never by insertion.
+log exists to keep. Listing is ordered by `occurredAt`, never by insertion — and then by `id`,
+because `occurredAt` ties: the events one pipeline run publishes carry the run's finish instant.
 
 `parentId` is the id of the event that **caused** this one, or null for a root — the platform's
 causation edge, and the one relation this table has. It records what a timeline cannot: a release
@@ -171,6 +172,53 @@ It is a query parameter on the route that already exists, and that is not only e
 literal under `/events` would need an entry in `quarkus.quinoa.ignored-path-prefixes` in the same
 commit. This is the one addition that needs none, so this feature does not touch that key at all.
 
+## Reading the log
+
+    GET /events/api/events?limit=200&cursor=<occurredAt>,<id>&name=A,B&since=<instant>&q=<text>
+    GET /events/api/events/names   → { "names": ["BuildSuccessful", "SCMRelease", …] }
+
+The list answers a **page**, and its envelope grew one field:
+
+```json
+{ "events": [ … ], "nextCursor": "2026-08-01T08:52:23.928965Z,0bdbe98d-…" }
+```
+
+`nextCursor` is `null` on the last page, and that null is the only end-of-log signal a client needs.
+A full page is not one, and there is no count — the route is asked for one row more than the page
+holds, so it knows the answer without a second query. The field was appended to a shape that already
+shipped, so a consumer that never reads it reads the list it always read.
+
+| | |
+|---|---|
+| `limit` | page size. Absent is **200**, above **1000** is 1000, anything that is not a whole number ≥ 1 is a `400`. The clamp is silent-safe: the page says what it holds and whether more exist |
+| `cursor` | `<occurredAt>,<id>` — the last row of the previous page |
+| `name` | comma-separated, the **same vocabulary** a subscribe frame names, so a filter means one thing live and one thing historically |
+| `since` | inclusive lower bound on `occurredAt`. There is deliberately no `until`: the cursor **is** the upper bound |
+| `q` | case-insensitive substring of the payload |
+
+**The cursor is composite, and that is the whole design of it.** `occurredAt` is not unique and
+cannot be made unique — the events one pipeline run publishes carry the run's finish instant, so a
+fork's siblings tie by construction — and a scalar `before=<occurredAt>` cursor whose boundary lands
+on a tie either repeats a sibling or drops one, on precisely the rows a release train is read for.
+The pair supports `occurred_at < :at or (occurred_at = :at and id < :id)`, which has no such gap. The
+list's sort carries the id for the same reason: without it a tied pair comes back in whatever order
+the database picked this time, and the log's order is not reproducible across two identical requests.
+
+**`q` searches the payload as a string and parses nothing.** There is no one key that means "which
+repository" — a build names it under `repoId`, a release under `repository` — so `q=qits-stt` finds
+all of them, over-matches slightly, and is named for what it is. The server's stance that the payload
+is opaque is what makes the idempotent publish's byte-for-byte comparison true, and no read is worth
+giving it up.
+
+**`?parentId=` takes none of these and is answered whole.** A parent's children are one per artifact
+a pipeline declares — bounded by a file in a repository rather than by history — so its `nextCursor`
+is always `null`.
+
+`/names` is `select distinct name order by name`. It is a route because the alternative is fetching
+all of history to learn five strings, which is the thing paging exists to stop; it is a literal
+beside the `/{id}` template, and JAX-RS matches literal characters first, which the suite pins rather
+than trusts. Both live under `/events/api`, so `quarkus.quinoa.ignored-path-prefixes` is untouched.
+
 ## The client
 
 [qits-spa-events](https://github.com/QuicklyIterateTheSoftware/qits-spa-events) — Angular 21,
@@ -185,7 +233,7 @@ That gives this repo a clone rule with two halves:
     git clone … && git submodule update --init
 
 - **The test suite needs neither node nor the submodule.** Quinoa is disabled by default in test
-  mode (`Quinoa is disabled by default in tests.`), so all 64 `@QuarkusTest`s are green against an
+  mode (`Quinoa is disabled by default in tests.`), so all 84 `@QuarkusTest`s are green against an
   empty `webui/` on a machine with no node at all — `./mvnw test`, measured.
 - **Anything that reaches `package` needs both**, and that includes `./mvnw verify`, which runs
   `package` on its way to failsafe. An uninitialised gitlink is an *empty directory*, and that is

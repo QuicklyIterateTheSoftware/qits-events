@@ -8,6 +8,9 @@ import static org.hamcrest.Matchers.hasItem;
 import static org.hamcrest.Matchers.hasKey;
 import static org.hamcrest.Matchers.notNullValue;
 import static org.hamcrest.Matchers.nullValue;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.http.ContentType;
@@ -177,6 +180,285 @@ class EventApiTest {
         .statusCode(200)
         .body("event", hasKey("parentId"))
         .body("event.parentId", nullValue());
+  }
+
+  /**
+   * The rows a paging test needs to see and no others. This suite shares one table with every other
+   * test in it — there is no wipe between cases — so each paging case stamps a nonce into the
+   * payload and reads its own rows back through {@code ?q=}, which makes the fixture exact and
+   * exercises the search at the same time.
+   */
+  private String nonce() {
+    return "nonce-" + System.nanoTime();
+  }
+
+  private String payloadWith(String nonce) {
+    return "{\"mark\":\"" + nonce + "\"}";
+  }
+
+  @Test
+  void theNamesRouteAnswersTheVocabularyRatherThanFourOhFouringAsAnId() {
+    // /names and /{id} are siblings under one @Path. JAX-RS sorts literal characters ahead of a
+    // template, so /events/api/events/names reaches the vocabulary and not EventService.get("names")
+    // — a spec guarantee this route leans on, which is exactly why it is pinned here rather than
+    // trusted. A regression answers 404 with a JSON body that reads "Event not found: names".
+    String name = "Vocabulary" + System.nanoTime();
+    create(name, "2026-07-31T09:00:00Z", null, null);
+
+    given()
+        .when()
+        .get("/events/api/events/names")
+        .then()
+        .statusCode(200)
+        .contentType(ContentType.JSON)
+        .body("names", hasItem(name));
+
+    // ... and the template still owns everything that is not the literal.
+    given().when().get("/events/api/events/not-an-id").then().statusCode(404);
+  }
+
+  @Test
+  void theVocabularyHasEachNameOnceAndInOrder() {
+    String stem = "Vocab" + System.nanoTime();
+    create(stem + "-b", "2026-07-31T09:00:00Z", null, null);
+    create(stem + "-b", "2026-07-31T09:00:01Z", null, null);
+    create(stem + "-a", "2026-07-31T09:00:02Z", null, null);
+
+    var names =
+        given()
+            .when()
+            .get("/events/api/events/names")
+            .then()
+            .statusCode(200)
+            .extract()
+            .jsonPath()
+            .getList("names", String.class);
+
+    assertEquals(
+        java.util.List.of(stem + "-a", stem + "-b"),
+        names.stream().filter(n -> n.startsWith(stem)).toList());
+    assertEquals(names.stream().distinct().toList(), names, "a vocabulary lists each name once");
+    assertEquals(names.stream().sorted().toList(), names, "and in alphabetical order");
+  }
+
+  @Test
+  void theLimitIsHonouredAndTheCursorWalksTheRestOfTheLog() {
+    // The parameter used to be UNKNOWN rather than merely unhonoured: the method declared parentId
+    // alone, so JAX-RS dropped `limit` in silence and answered with all of history while the client
+    // believed it had asked for five rows.
+    String nonce = nonce();
+    for (int i = 1; i <= 5; i++) {
+      create("Paged " + i, "2026-0" + i + "-01T00:00:00Z", payloadWith(nonce), null);
+    }
+
+    var walked = new java.util.ArrayList<String>();
+    String cursor = null;
+    int pages = 0;
+    do {
+      var request = given().queryParam("q", nonce).queryParam("limit", 2);
+      if (cursor != null) {
+        request = request.queryParam("cursor", cursor);
+      }
+      var body =
+          request.when().get("/events/api/events").then().statusCode(200).extract().jsonPath();
+      walked.addAll(body.getList("events.name", String.class));
+      cursor = body.getString("nextCursor");
+      pages++;
+    } while (cursor != null);
+
+    assertEquals(
+        java.util.List.of("Paged 5", "Paged 4", "Paged 3", "Paged 2", "Paged 1"),
+        walked,
+        "the cursor must walk every row exactly once, newest first");
+    assertEquals(3, pages, "five rows in pages of two is three pages, the last one short");
+  }
+
+  @Test
+  void aPageBoundaryThatFallsOnATieSplitsItRatherThanLosingASibling() {
+    // The fork the live log is full of: two events published by one pipeline run carry the run's
+    // finish instant to the microsecond. A scalar `before=<occurredAt>` cursor either skips the
+    // second sibling or repeats the first; the composite `<occurredAt>,<id>` resumes after a ROW.
+    String nonce = nonce();
+    String tie = "2026-08-01T08:52:23.928965Z";
+    create("Tie newest", "2026-08-01T09:00:00Z", payloadWith(nonce), null);
+    create("Tie fork one", tie, payloadWith(nonce), null);
+    create("Tie fork two", tie, payloadWith(nonce), null);
+    create("Tie oldest", "2026-08-01T08:00:00Z", payloadWith(nonce), null);
+
+    var first =
+        given()
+            .queryParam("q", nonce)
+            .queryParam("limit", 2)
+            .when()
+            .get("/events/api/events")
+            .then()
+            .statusCode(200)
+            .extract()
+            .jsonPath();
+    var ids = new java.util.ArrayList<>(first.getList("events.id", String.class));
+    String cursor = first.getString("nextCursor");
+    assertNotNull(cursor, "a full page with history behind it must say where to resume");
+    // The boundary is inside the tie, which is the case under test: the cursor carries the shared
+    // instant AND the id of the sibling already handed out.
+    assertTrue(cursor.startsWith(tie + ","), "the boundary must fall on the tie; got " + cursor);
+
+    var second =
+        given()
+            .queryParam("q", nonce)
+            .queryParam("limit", 2)
+            .queryParam("cursor", cursor)
+            .when()
+            .get("/events/api/events")
+            .then()
+            .statusCode(200)
+            .body("nextCursor", nullValue())
+            .extract()
+            .jsonPath();
+    ids.addAll(second.getList("events.id", String.class));
+
+    assertEquals(4, ids.size(), "every row exactly once across the tie: " + ids);
+    assertEquals(4, java.util.Set.copyOf(ids).size(), "and none of them twice: " + ids);
+  }
+
+  @Test
+  void aLimitThatIsNotAPageSizeIsFourHundredAndOneAboveTheCapIsClamped() {
+    given().queryParam("limit", "0").when().get("/events/api/events").then().statusCode(400);
+    given().queryParam("limit", "-1").when().get("/events/api/events").then().statusCode(400);
+    given()
+        .queryParam("limit", "lots")
+        .when()
+        .get("/events/api/events")
+        .then()
+        .statusCode(400)
+        .contentType(ContentType.JSON)
+        .body("message", notNullValue());
+
+    // The clamp is silent-safe rather than an error: the page says what it holds and whether more
+    // exist, so a client asking loosely for 5,000 rows is answered instead of corrected.
+    given().queryParam("limit", "5000").when().get("/events/api/events").then().statusCode(200);
+  }
+
+  @Test
+  void anUnreadableCursorOrSinceIsFourHundredRatherThanAnIgnoredFilter() {
+    // Ignoring it would answer with the head of the log, which a paging client reads as the end of
+    // history — a wrong answer that looks like a right one.
+    given().queryParam("cursor", "no-comma").when().get("/events/api/events").then().statusCode(400);
+    given()
+        .queryParam("cursor", "yesterday,some-id")
+        .when()
+        .get("/events/api/events")
+        .then()
+        .statusCode(400);
+    given().queryParam("since", "yesterday").when().get("/events/api/events").then().statusCode(400);
+  }
+
+  @Test
+  void theNameFilterTakesOneNameOrACommaSeparatedSet() {
+    String stem = "Named" + System.nanoTime();
+    create(stem + "-build", "2026-08-01T09:00:00Z", null, null);
+    create(stem + "-scm", "2026-08-01T09:00:01Z", null, null);
+    create(stem + "-software", "2026-08-01T09:00:02Z", null, null);
+
+    given()
+        .queryParam("name", stem + "-scm")
+        .when()
+        .get("/events/api/events")
+        .then()
+        .statusCode(200)
+        .body("events.name", contains(stem + "-scm"));
+
+    // A comma list, and the vocabulary is the stream's — the set a subscribe frame would name.
+    given()
+        .queryParam("name", stem + "-scm," + stem + "-software")
+        .when()
+        .get("/events/api/events")
+        .then()
+        .statusCode(200)
+        .body("events.name", contains(stem + "-software", stem + "-scm"));
+
+    given()
+        .queryParam("name", "NoSuchName" + System.nanoTime())
+        .when()
+        .get("/events/api/events")
+        .then()
+        .statusCode(200)
+        .body("events", empty());
+  }
+
+  @Test
+  void sinceIsAnInclusiveLowerBoundAndTheCursorIsTheOnlyUpperOne() {
+    String stem = "Since" + System.nanoTime();
+    create(stem + "-before", "2026-07-31T23:59:59Z", null, null);
+    create(stem + "-boundary", "2026-08-01T00:00:00Z", null, null);
+    create(stem + "-after", "2026-08-01T00:00:01Z", null, null);
+
+    given()
+        .queryParam("name", stem + "-before," + stem + "-boundary," + stem + "-after")
+        .queryParam("since", "2026-08-01T00:00:00Z")
+        .when()
+        .get("/events/api/events")
+        .then()
+        .statusCode(200)
+        .body("events.name", contains(stem + "-after", stem + "-boundary"));
+  }
+
+  @Test
+  void qIsASubstringOfThePayloadAndFindsTheRepositoryUnderEitherKey() {
+    // The honest shape of "show me qits-stt": a build names its repository under repoId and a
+    // release names it under repository, so there is no one key to filter on and this service parses
+    // no payload. Searching the opaque string finds all of them, over-matches slightly, and says so.
+    String nonce = nonce();
+    create("Q build", "2026-08-01T09:00:00Z", "{\"repoId\":\"" + nonce + "\"}", null);
+    create("Q release", "2026-08-01T09:00:01Z", "{\"repository\":\"" + nonce + "\"}", null);
+    create("Q package", "2026-08-01T09:00:02Z", "{\"packageName\":\"qits/" + nonce + "\"}", null);
+    create("Q elsewhere", "2026-08-01T09:00:03Z", "{\"repoId\":\"somebody-else\"}", null);
+    create("Q payloadless", "2026-08-01T09:00:04Z", null, null);
+
+    given()
+        .queryParam("q", nonce)
+        .when()
+        .get("/events/api/events")
+        .then()
+        .statusCode(200)
+        .body("events.name", contains("Q package", "Q release", "Q build"));
+
+    // Case-insensitive, and a miss is an empty page rather than a 404.
+    given()
+        .queryParam("q", nonce.toUpperCase(java.util.Locale.ROOT))
+        .when()
+        .get("/events/api/events")
+        .then()
+        .statusCode(200)
+        .body("events", org.hamcrest.Matchers.hasSize(3));
+
+    given()
+        .queryParam("q", "no-payload-says-this-" + System.nanoTime())
+        .when()
+        .get("/events/api/events")
+        .then()
+        .statusCode(200)
+        .body("events", empty())
+        .body("nextCursor", nullValue());
+  }
+
+  @Test
+  void theChildrenOfOneEventAreAnsweredWholeAndCarryNoCursor() {
+    // A parent's children are one per artifact a pipeline declares — bounded by a file in a
+    // repository, not by history — so ?parentId= is not paged and says so with an explicit null.
+    String parent = create("Fork parent " + System.nanoTime(), "2026-08-01T09:00:00Z", null, null);
+    create("Fork child a", "2026-08-01T09:00:01Z", null, null, parent);
+    create("Fork child b", "2026-08-01T09:00:01Z", null, null, parent);
+
+    given()
+        .queryParam("parentId", parent)
+        .queryParam("limit", 1)
+        .when()
+        .get("/events/api/events")
+        .then()
+        .statusCode(200)
+        .body("events", org.hamcrest.Matchers.hasSize(2))
+        .body("$", hasKey("nextCursor"))
+        .body("nextCursor", nullValue());
   }
 
   @Test
