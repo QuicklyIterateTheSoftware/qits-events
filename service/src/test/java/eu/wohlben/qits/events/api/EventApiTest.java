@@ -10,6 +10,7 @@ import static org.hamcrest.Matchers.notNullValue;
 import static org.hamcrest.Matchers.nullValue;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.quarkus.test.junit.QuarkusTest;
@@ -318,6 +319,59 @@ class EventApiTest {
 
     assertEquals(4, ids.size(), "every row exactly once across the tie: " + ids);
     assertEquals(4, java.util.Set.copyOf(ids).size(), "and none of them twice: " + ids);
+  }
+
+  @Test
+  void thePageEnvelopeIsEventsAndNextCursorAndNothingElse() {
+    // The shape the SPA is written against, and it is frozen: `events` and `nextCursor`, with
+    // nextCursor null on the last page. No count, no hasMore — the extra row this route fetches
+    // answers "is there more" already, and a second way to say it is a second thing to keep true.
+    // Adding a field here is a client change in another repository, so it is a decision rather than
+    // a convenience.
+    var last =
+        given()
+            .queryParam("q", "no-payload-says-this-" + System.nanoTime())
+            .when()
+            .get("/events/api/events")
+            .then()
+            .statusCode(200)
+            .extract()
+            .jsonPath()
+            .getMap("$");
+    assertEquals(java.util.Set.of("events", "nextCursor"), last.keySet());
+    assertNull(last.get("nextCursor"), "the last page says so with an explicit null");
+  }
+
+  @Test
+  void aCursorIsUnderstoodInTheSpellingAClientActuallySendsIt() {
+    // Angular's HttpParams codec leaves `,` and `:` unencoded, so the cursor arrives literally —
+    // `cursor=2026-08-01T08:52:23.928965Z,<id>` — and a comma-separated `name=A,B` does too.
+    // Measured on the deployed client, not assumed. Percent-encoding is equally fine; both decode to
+    // one string, and this pins that neither spelling is required.
+    String nonce = nonce();
+    create("Literal newest", "2026-08-01T09:00:00Z", payloadWith(nonce), null);
+    create("Literal oldest", "2026-08-01T08:00:00Z", payloadWith(nonce), null);
+
+    String cursor =
+        given()
+            .queryParam("q", nonce)
+            .queryParam("limit", 1)
+            .when()
+            .get("/events/api/events")
+            .then()
+            .statusCode(200)
+            .extract()
+            .path("nextCursor");
+    assertTrue(cursor.contains(",") && cursor.contains(":"), cursor);
+
+    given()
+        .urlEncodingEnabled(false)
+        .when()
+        .get("/events/api/events?q=" + nonce + "&limit=1&cursor=" + cursor)
+        .then()
+        .statusCode(200)
+        .body("events.name", contains("Literal oldest"))
+        .body("nextCursor", nullValue());
   }
 
   @Test

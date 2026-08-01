@@ -186,10 +186,14 @@ class EventServiceTest extends EventsTestSupport {
   void theNameFilterTakesOneNameOrACommaSeparatedSet() {
     // The same vocabulary the stream's subscribe frame uses, so a filter means one thing live and
     // one thing historically.
-    Instant when = Instant.parse("2026-08-01T09:00:00Z");
-    eventService.create("BuildSuccessful", when, null, null, null);
-    eventService.create("SCMRelease", when, null, null, null);
-    eventService.create("SoftwareRelease", when, null, null, null);
+    //
+    // Three DISTINCT instants, because this case is about which rows come back and not about how a
+    // tie is broken. Written first with one shared instant, it asserted an order that fell through
+    // to the id — random UUIDs — and passed twice before failing: the tiebreaker is total, which is
+    // the point of it, but it is not the caller's to predict.
+    eventService.create("BuildSuccessful", Instant.parse("2026-08-01T09:00:00Z"), null, null, null);
+    eventService.create("SCMRelease", Instant.parse("2026-08-01T09:00:01Z"), null, null, null);
+    eventService.create("SoftwareRelease", Instant.parse("2026-08-01T09:00:02Z"), null, null, null);
 
     assertEquals(
         List.of("SCMRelease"),

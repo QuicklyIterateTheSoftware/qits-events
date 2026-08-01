@@ -14,7 +14,7 @@ inheriting them, and why every suite runs on in-memory H2.
 right because the platform reference states it loosely:
 
 - `./mvnw test` — needs **neither node nor the webui submodule**. Quinoa is disabled by default in
-  test mode (it says so: `Quinoa is disabled by default in tests.`), so all 84 `@QuarkusTest`s pass
+  test mode (it says so: `Quinoa is disabled by default in tests.`), so all 86 `@QuarkusTest`s pass
   against an empty `webui/` on a machine with no node at all — the stream socket included, since
   a websocket is not a Quinoa concern. Measured, not assumed.
 - `./mvnw verify` — runs `package` on its way to failsafe, and `package` is where Quinoa augments.
