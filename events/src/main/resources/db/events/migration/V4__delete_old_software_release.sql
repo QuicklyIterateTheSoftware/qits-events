@@ -1,0 +1,21 @@
+-- `SoftwareRelease` changed meaning, so the rows that carry the old meaning go.
+--
+-- It used to fire when qits-workspaces accepted the release push — "source control has this
+-- version". That moment is now `SCMRelease`. `SoftwareRelease` is now published by qits-ci when a
+-- repository's release pipeline goes green, and it means "this artifact is in qits-artifacts and
+-- you can install it", with the package type and the exact package name in the payload. Three rows
+-- written this morning say `SoftwareRelease` and mean the old thing. Left in place they would sit
+-- beside rows of the same name with a different payload shape, and no reader could tell which
+-- promise a row makes.
+--
+-- Deleted, not rewritten: there is no production, migrations here may be destructive, and the old
+-- rows record a design that no longer exists rather than history worth keeping.
+--
+-- By name, not by id. The id list is three values on one machine; the name is the thing that
+-- changed meaning, so the name is what the statement should say.
+--
+-- One of the three is the parent of a `BuildSuccessful` row that stays. That edge is left dangling
+-- on purpose and costs nothing: `parent_id` is deliberately not a foreign key (see
+-- `V3__parent_id.sql`), and the reader treats an unresolvable parent as the start of a chain. So
+-- the surviving child becomes a chain start, which is the honest reading — its cause is gone.
+delete from Event where name = 'SoftwareRelease';
