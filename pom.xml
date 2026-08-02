@@ -25,7 +25,7 @@
          monorepo and no parent to inherit from. -->
     <groupId>eu.wohlben.qits</groupId>
     <artifactId>qits-events</artifactId>
-    <version>2026.802.185055</version>
+    <version>2026.802.190734</version>
     <packaging>pom</packaging>
     <name>qits-events</name>
 
