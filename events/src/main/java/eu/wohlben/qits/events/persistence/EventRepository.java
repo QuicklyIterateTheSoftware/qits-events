@@ -50,6 +50,13 @@ public class EventRepository implements PanacheRepositoryBase<Event, String> {
       clauses.add("lower(payload) like :search escape '!'");
       parameters.and("search", query.search());
     }
+    for (int i = 0; i < query.attrFilters().size(); i++) {
+      // One clause per ?attr=, same scan as ?q= above, narrowed to one "key":"value" fragment —
+      // EventQuery.attrFiltersOf already built the escaped pattern, this just binds it.
+      String name = "attr" + i;
+      clauses.add("lower(payload) like :" + name + " escape '!'");
+      parameters.and(name, query.attrFilters().get(i));
+    }
     if (query.cursor() != null) {
       // The composite predicate: strictly older, or the same instant and a smaller id. This is the
       // half a scalar `before=<occurredAt>` cursor cannot express, and the reason a fork's siblings

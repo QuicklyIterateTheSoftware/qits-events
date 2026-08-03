@@ -23,7 +23,12 @@ import java.util.Locale;
  * ask for everything and said it clumsily gets everything.
  */
 public record EventQuery(
-    List<String> names, Instant since, String search, EventCursor cursor, int limit) {
+    List<String> names,
+    Instant since,
+    String search,
+    List<String> attrFilters,
+    EventCursor cursor,
+    int limit) {
 
   /**
    * The page a client that asks for no size gets. 200 rows is roughly 90 KB of this log's rows —
@@ -37,6 +42,12 @@ public record EventQuery(
    * clamped, and a demand for 5,000 rows is a client asking loosely rather than wrongly.
    */
   public static final int MAX_LIMIT = 1000;
+
+  /**
+   * The count no request gets past. Each filter is its own scan of the opaque payload column, the
+   * same cost {@code ?q=} pays once — this bounds how many of that scan one request can ask for.
+   */
+  public static final int MAX_ATTR_FILTERS = 8;
 
   /** Everything, newest first, at the default page size. */
   public static EventQuery defaults() {
@@ -55,8 +66,22 @@ public record EventQuery(
    *     cap, and nothing else is a page size at all
    */
   public static EventQuery of(String name, String since, String q, String cursor, String limit) {
+    return of(name, since, q, cursor, limit, List.of());
+  }
+
+  /**
+   * @param attr repeatable {@code key=value} filters, each an exact fragment match — see {@link
+   *     #attrFiltersOf}. Absent or {@code null} means no attribute filter at all.
+   */
+  public static EventQuery of(
+      String name, String since, String q, String cursor, String limit, List<String> attr) {
     return new EventQuery(
-        namesOf(name), sinceOf(since), searchOf(q), EventCursor.parse(cursor), limitOf(limit));
+        namesOf(name),
+        sinceOf(since),
+        searchOf(q),
+        attrFiltersOf(attr),
+        EventCursor.parse(cursor),
+        limitOf(limit));
   }
 
   private static List<String> namesOf(String name) {
@@ -101,13 +126,53 @@ public record EventQuery(
     if (q == null || q.isBlank()) {
       return null;
     }
-    String escaped =
-        q.trim()
-            .toLowerCase(Locale.ROOT)
-            .replace("!", "!!")
-            .replace("%", "!%")
-            .replace("_", "!_");
-    return "%" + escaped + "%";
+    return "%" + escapeForLike(q.trim()) + "%";
+  }
+
+  /**
+   * Repeatable {@code key=value} filters, each turned into a {@code lower(payload) like …} pattern
+   * matching the exact fragment {@code "key":"value"} a canonically-published payload holds for a
+   * string-valued key — one filter narrowed to one field, the same scan {@link #searchOf} already
+   * pays for the whole payload.
+   *
+   * <p><b>The closing quote is part of the literal</b>, deliberately: without it {@code
+   * attr=packageType=dae} would match a value of {@code daemon}, because the pattern would be {@code
+   * ?q=} wearing a key name rather than an exact match.
+   *
+   * <p>Blank entries are dropped — the rule {@code ?parentId=} already follows — and any entry with
+   * no {@code =} at all, or an empty key, is a 400 naming the parameter: a filter that cannot say
+   * which key it means is not a looser question, it is a malformed one.
+   */
+  private static List<String> attrFiltersOf(List<String> attr) {
+    if (attr == null || attr.isEmpty()) {
+      return List.of();
+    }
+    List<String> filters = new ArrayList<>();
+    for (String each : attr) {
+      if (each == null || each.isBlank()) {
+        continue;
+      }
+      int separator = each.indexOf('=');
+      String key = separator < 0 ? "" : each.substring(0, separator).trim();
+      if (separator < 0 || key.isEmpty()) {
+        throw new BadRequestException("attr must be key=value: " + each);
+      }
+      String value = each.substring(separator + 1).trim();
+      filters.add("%\"" + escapeForLike(key) + "\":\"" + escapeForLike(value) + "\"%");
+    }
+    if (filters.size() > MAX_ATTR_FILTERS) {
+      throw new BadRequestException("attr accepts at most " + MAX_ATTR_FILTERS + " filters");
+    }
+    return List.copyOf(filters);
+  }
+
+  /**
+   * Lower-cased, with {@code %}/{@code _}/{@code !} escaped so a caller's literal character is never
+   * read as a LIKE wildcard — shared by {@link #searchOf} and {@link #attrFiltersOf}, which differ
+   * only in how they wrap the result.
+   */
+  private static String escapeForLike(String raw) {
+    return raw.toLowerCase(Locale.ROOT).replace("!", "!!").replace("%", "!%").replace("_", "!_");
   }
 
   private static int limitOf(String limit) {

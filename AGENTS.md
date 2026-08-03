@@ -200,15 +200,25 @@ The list route pages, and two of its properties are easy to undo by accident:
   one. If a future change makes the pair look like ceremony, read `EventCursor`.
 
 `EventQuery` parses every filter, and the boundary hands it the caller's **text**: `limit`, `since`,
-`q`, `cursor` and `name` are all `String` `@QueryParam`s. That is deliberate — one place decides what
-a bad value means and every bad value is a 400 whose message names the parameter, where a JAX-RS
-parameter converter answers 404 for a query parameter it cannot convert, with no body worth reading.
-Blank is absent throughout, the rule `?parentId=` already followed.
+`q`, `cursor` and `name` are all `String` `@QueryParam`s, and `attr` is a repeatable `List<String>` of
+the same unparsed text. That is deliberate — one place decides what a bad value means and every bad
+value is a 400 whose message names the parameter, where a JAX-RS parameter converter answers 404 for
+a query parameter it cannot convert, with no body worth reading. Blank is absent throughout, the rule
+`?parentId=` already followed.
 
 `?q=` is a substring of the payload and **parses nothing**. The payload is opaque here — that is what
 makes the idempotent publish's byte-for-byte comparison true — and there is no single key meaning
 "which repository" to project anyway (`repoId` on a build, `repository` on a release). A projected
 column is the thing to refuse first if someone wants exactness.
+
+`?attr=<key>=<value>`, repeatable and ANDed, is the exact question `?q=` cannot answer, without
+projecting anything: `EventQuery.attrFiltersOf` builds one `lower(payload) like …` pattern per filter
+matching the literal `"key":"value"`, **closing quote included** — so `attr=packageType=dae` does not
+match a value of `daemon` — and `EventRepository.listPage` binds one such clause per filter beside the
+`?q=` clause. It leans on `CanonicalJson`'s guarantee (alphabetically-sorted keys, string values
+quoted) rather than on payload adjacency, so it stays exact even as fields are added around it; it is
+honest only for **string-valued** keys of events published through `CanonicalJson`, and it is a scan
+like `?q=`, with no migration, no index and no new route.
 
 `GET /events/api/events/names` is a literal beside the `/{id}` template. JAX-RS sorts literal
 characters ahead of a template so it wins, but that is a spec guarantee being leaned on, so
