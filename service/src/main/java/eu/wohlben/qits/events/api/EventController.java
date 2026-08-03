@@ -83,6 +83,12 @@ public class EventController {
    *       parameter; the cursor is the upper bound.
    *   <li>{@code ?q=} — a case-insensitive substring of the payload, which this service stores and
    *       hands back as an opaque string and does not parse here either.
+   *   <li>{@code ?attr=<key>=<value>} — repeatable, ANDed. An exact match of the fragment {@code
+   *       "key":"value"} in the payload, case-insensitive. This service still parses no payload: it
+   *       builds a literal whose shape the platform's own canonical-JSON publisher guarantees, so it
+   *       works for string-valued keys of events published through {@code CanonicalJson} and nothing
+   *       else, and it is a scan like {@code ?q=} rather than an indexed lookup. A value with no
+   *       {@code =} is a 400 naming the parameter.
    * </ul>
    *
    * <p><b>{@code ?parentId=} is answered whole and takes none of them.</b> A parent's children are
@@ -101,12 +107,13 @@ public class EventController {
       @QueryParam("name") String name,
       @QueryParam("since") String since,
       @QueryParam("q") String q,
+      @QueryParam("attr") List<String> attr,
       @QueryParam("cursor") String cursor,
       @QueryParam("limit") String limit) {
     if (parentId != null && !parentId.isBlank()) {
       return new ListEventsRequest.Response(toDtos(eventService.listChildrenOf(parentId)), null);
     }
-    var page = eventService.list(EventQuery.of(name, since, q, cursor, limit));
+    var page = eventService.list(EventQuery.of(name, since, q, cursor, limit, attr));
     return new ListEventsRequest.Response(
         toDtos(page.events()),
         page.nextCursor() == null ? null : page.nextCursor().format());

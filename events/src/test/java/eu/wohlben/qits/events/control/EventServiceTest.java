@@ -244,6 +244,62 @@ class EventServiceTest extends EventsTestSupport {
   }
 
   @Test
+  void attrFilterMatchesExactFragmentAndAndsAcrossFilters() {
+    Instant when = Instant.parse("2026-08-01T09:00:00Z");
+    eventService.create(
+        "Daemon", when, "{\"packageName\":\"qits-ci-daemon\",\"packageType\":\"daemon\"}", null, null);
+    eventService.create(
+        "Docker", when, "{\"packageName\":\"qits-ci\",\"packageType\":\"docker\"}", null, null);
+
+    assertEquals(
+        List.of("Daemon"),
+        names(
+            eventService.list(
+                EventQuery.of(null, null, null, null, null, List.of("packageType=daemon")))));
+    // "dae" is a substring of "daemon", but the closing quote in the built literal keeps a shorter
+    // value from matching a longer one — the property that makes this an exact match rather than q
+    // wearing a key name.
+    assertEquals(
+        List.of(),
+        names(
+            eventService.list(
+                EventQuery.of(null, null, null, null, null, List.of("packageType=dae")))));
+    // Two filters AND rather than OR.
+    assertEquals(
+        List.of("Daemon"),
+        names(
+            eventService.list(
+                EventQuery.of(
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    List.of("packageType=daemon", "packageName=qits-ci-daemon")))));
+  }
+
+  @Test
+  void attrFilterBlankIsAbsentAndMalformedIsRejected() {
+    // The rule ?parentId= already follows: a filter said clumsily is no filter at all.
+    assertEquals(
+        EventQuery.of(null, null, null, null, null),
+        EventQuery.of(null, null, null, null, null, List.of("", "   ")));
+    assertThrows(
+        BadRequestException.class,
+        () -> EventQuery.of(null, null, null, null, null, List.of("no-equals-sign")));
+  }
+
+  @Test
+  void tooManyAttrFiltersIsRejected() {
+    List<String> tooMany =
+        java.util.stream.IntStream.rangeClosed(0, EventQuery.MAX_ATTR_FILTERS)
+            .mapToObj(i -> "k" + i + "=v" + i)
+            .toList();
+    assertThrows(
+        BadRequestException.class, () -> EventQuery.of(null, null, null, null, null, tooMany));
+  }
+
+  @Test
   void theVocabularyIsEachNameOnceAlphabetically() {
     Instant when = Instant.parse("2026-08-01T09:00:00Z");
     eventService.create("SoftwareRelease", when, null, null, null);

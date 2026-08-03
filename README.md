@@ -175,6 +175,7 @@ commit. This is the one addition that needs none, so this feature does not touch
 ## Reading the log
 
     GET /events/api/events?limit=200&cursor=<occurredAt>,<id>&name=A,B&since=<instant>&q=<text>
+                          &attr=<key>=<value>&attr=<key>=<value>
     GET /events/api/events/names   → { "names": ["BuildSuccessful", "SCMRelease", …] }
 
 The list answers a **page**, and its envelope grew one field:
@@ -195,6 +196,7 @@ shipped, so a consumer that never reads it reads the list it always read.
 | `name` | comma-separated, the **same vocabulary** a subscribe frame names, so a filter means one thing live and one thing historically |
 | `since` | inclusive lower bound on `occurredAt`. There is deliberately no `until`: the cursor **is** the upper bound |
 | `q` | case-insensitive substring of the payload |
+| `attr` | repeatable `key=value`, ANDed. An exact, case-insensitive match of the fragment `"key":"value"` in the payload — string-valued keys of events published through `CanonicalJson` only, and, like `q`, a scan rather than an indexed lookup. A value with no `=` is a `400` naming the parameter |
 
 **The cursor is composite, and that is the whole design of it.** `occurredAt` is not unique and
 cannot be made unique — the events one pipeline run publishes carry the run's finish instant, so a
@@ -209,6 +211,16 @@ repository" — a build names it under `repoId`, a release under `repository` �
 all of them, over-matches slightly, and is named for what it is. The server's stance that the payload
 is opaque is what makes the idempotent publish's byte-for-byte comparison true, and no read is worth
 giving it up.
+
+**`attr` is the exact question `q` cannot answer, at the price of naming the key.** `?attr=name=value`
+matches the literal `"name":"value"` — closing quote included, so `attr=packageType=dae` does **not**
+match a value of `daemon` — and repeating it ANDs the filters. It still parses no payload: the server
+builds a literal whose shape the platform's own canonical publisher guarantees (alphabetically-sorted
+keys, string values quoted), rather than reading the payload as JSON, so it is honest only for
+string-valued keys of events published through `CanonicalJson`, and it is a scan like `q`, not an
+index. Blank entries are dropped, the rule `?parentId=` already follows, and a value with no `=` is a
+`400` naming the parameter. No migration, no index, no new route — this is a query parameter on the
+route that already exists, the same as every filter above it.
 
 **`?parentId=` takes none of these and is answered whole.** A parent's children are one per artifact
 a pipeline declares — bounded by a file in a repository rather than by history — so its `nextCursor`

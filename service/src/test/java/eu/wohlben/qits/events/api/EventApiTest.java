@@ -13,6 +13,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import eu.wohlben.qits.events.control.EventQuery;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.http.ContentType;
 import jakarta.ws.rs.core.Response;
@@ -493,6 +494,152 @@ class EventApiTest {
         .statusCode(200)
         .body("events", empty())
         .body("nextCursor", nullValue());
+  }
+
+  @Test
+  void anAttrFilterMatchesAnExactKeyValueFragment() {
+    String nonce = nonce();
+    create(
+        "Attr daemon " + nonce,
+        "2026-08-01T09:00:00Z",
+        "{\"packageName\":\"qits-ci-daemon-" + nonce + "\",\"packageType\":\"daemon\"}",
+        null);
+    create(
+        "Attr docker " + nonce,
+        "2026-08-01T09:00:01Z",
+        "{\"packageName\":\"qits-ci-" + nonce + "\",\"packageType\":\"docker\"}",
+        null);
+
+    given()
+        .queryParam("attr", "packageType=daemon")
+        .queryParam("q", nonce)
+        .when()
+        .get("/events/api/events")
+        .then()
+        .statusCode(200)
+        .body("events.name", contains("Attr daemon " + nonce));
+  }
+
+  @Test
+  void anAttrFilterMatchesTheWholeValueNotASubstringOfIt() {
+    // The closing quote is part of the literal: "dae" is a substring of "daemon", but the pattern
+    // this filter builds is `"packageType":"dae"`, which the fragment `"packageType":"daemon"` does
+    // not contain. Without the closing quote this would be `?q=` wearing a key name.
+    String nonce = nonce();
+    create(
+        "Attr full value " + nonce,
+        "2026-08-01T09:00:00Z",
+        "{\"packageType\":\"daemon\",\"mark\":\"" + nonce + "\"}",
+        null);
+
+    given()
+        .queryParam("attr", "packageType=dae")
+        .queryParam("q", nonce)
+        .when()
+        .get("/events/api/events")
+        .then()
+        .statusCode(200)
+        .body("events", empty());
+
+    given()
+        .queryParam("attr", "packageType=daemon")
+        .queryParam("q", nonce)
+        .when()
+        .get("/events/api/events")
+        .then()
+        .statusCode(200)
+        .body("events.name", contains("Attr full value " + nonce));
+  }
+
+  @Test
+  void twoAttrFiltersAreAndedRatherThanOred() {
+    String nonce = nonce();
+    create(
+        "Attr both " + nonce,
+        "2026-08-01T09:00:00Z",
+        "{\"packageType\":\"daemon\",\"packageName\":\"qits-ci-daemon-" + nonce + "\"}",
+        null);
+    create(
+        "Attr type only " + nonce,
+        "2026-08-01T09:00:01Z",
+        "{\"packageType\":\"daemon\",\"packageName\":\"something-else-" + nonce + "\"}",
+        null);
+
+    given()
+        .queryParam("attr", "packageType=daemon")
+        .queryParam("attr", "packageName=qits-ci-daemon-" + nonce)
+        .queryParam("q", nonce)
+        .when()
+        .get("/events/api/events")
+        .then()
+        .statusCode(200)
+        .body("events.name", contains("Attr both " + nonce));
+  }
+
+  @Test
+  void aMalformedAttrIsFourHundredWithAMessage() {
+    given()
+        .queryParam("attr", "no-equals-sign")
+        .when()
+        .get("/events/api/events")
+        .then()
+        .statusCode(400)
+        .contentType(ContentType.JSON)
+        .body("message", notNullValue());
+  }
+
+  @Test
+  void aBlankAttrIsIgnoredRatherThanRejected() {
+    // The rule ?parentId= already follows: a client that meant to ask for nothing extra, clumsily.
+    given().queryParam("attr", "").when().get("/events/api/events").then().statusCode(200);
+  }
+
+  @Test
+  void tooManyAttrFiltersIsFourHundred() {
+    var request = given();
+    for (int i = 0; i <= EventQuery.MAX_ATTR_FILTERS; i++) {
+      request = request.queryParam("attr", "k" + i + "=v" + i);
+    }
+    request.when().get("/events/api/events").then().statusCode(400);
+  }
+
+  @Test
+  void anAttrFilterComposesWithNameAndLimit() {
+    String stem = "AttrCompose" + System.nanoTime();
+    create(stem + "-a", "2026-08-01T09:00:00Z", "{\"kind\":\"x\"}", null);
+    create(stem + "-b", "2026-08-01T09:00:01Z", "{\"kind\":\"x\"}", null);
+    create(stem + "-c", "2026-08-01T09:00:02Z", "{\"kind\":\"y\"}", null);
+
+    given()
+        .queryParam("name", stem + "-a," + stem + "-b," + stem + "-c")
+        .queryParam("attr", "kind=x")
+        .queryParam("limit", 1)
+        .when()
+        .get("/events/api/events")
+        .then()
+        .statusCode(200)
+        .body("events.name", contains(stem + "-b"));
+  }
+
+  @Test
+  void parentIdTakesNoneOfTheAttrFilters() {
+    // ?parentId= is answered whole and takes none of the list filters — attr included.
+    String parent = create("Attr parent " + System.nanoTime(), "2026-08-01T09:00:00Z", null, null);
+    create(
+        "Attr child",
+        "2026-08-01T09:00:01Z",
+        "{\"kind\":\"unrelated\"}",
+        null,
+        parent);
+
+    given()
+        .queryParam("parentId", parent)
+        .queryParam("attr", "kind=nothing-matches-this")
+        .when()
+        .get("/events/api/events")
+        .then()
+        .statusCode(200)
+        .body("events.name", contains("Attr child"));
   }
 
   @Test
