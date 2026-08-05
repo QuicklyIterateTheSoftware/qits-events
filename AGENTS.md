@@ -259,6 +259,16 @@ when the platform's Quarkus passes the version a release is built against.
   the entire suite fail with `Port already bound: 8081` on the one machine this repo is most likely
   to be built on. It also removes the `@QuarkusTest`-restart race the siblings carry as a documented
   flake. The same value is passed to failsafe in `service/pom.xml`.
+- **`OpenApiSchemaExportTest` writes `docs/openapi.yml`** from `/events/q/openapi`. Regenerate and
+  commit it whenever the REST surface changes:
+
+      ./mvnw -pl service -am test -Dtest=OpenApiSchemaExportTest -Dsurefire.failIfNoSpecifiedTests=false
+
+  It asserts nothing — the committed diff is the assertion, which is what makes an API change
+  reviewable instead of something a caller meets at runtime. Two things it does not cover: the test
+  classpath is indexed too, so a `@Path` resource under `src/test` lands in the document unless it
+  is `@Operation(hidden = true)` (`IdentityEchoResource` and `LogProbeResource` both carry it), and
+  `/events/stream` is a `@WebSocket`, which OpenAPI describes in no form at all.
 - **`mvn verify` passing does not mean the app starts.** Augmentation runs per `@QuarkusTest`
   regardless of packaging, so a missing `quarkus-maven-plugin` goal is invisible to the suite — it
   happened in qits-projects, an `<executions>` block under a `<build>` whose `<testResources>` came
