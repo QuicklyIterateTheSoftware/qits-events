@@ -44,6 +44,16 @@
         <quarkus.platform.group-id>io.quarkus.platform</quarkus.platform.group-id>
         <quarkus.platform.version>3.34.6</quarkus.platform.version>
 
+        <!-- The OTLP wire's generated message classes, TEST SCOPE ONLY (declared in service/pom.xml)
+             — what OtlpLogStub decodes an ExportLogsServiceRequest with, so the log-bridge proof
+             reads the bytes Quarkus actually exported instead of trusting that something arrived.
+             Not in the platform BOM, so pinned here; qits-observability, which decodes the same
+             messages in PRODUCTION code, pins the same version. The "-alpha" is about the Java
+             API's stability, not the wire's — the OTLP protobuf definitions are Stable. Don't
+             auto-bump. protobuf-java arrives with it and IS in the platform BOM, so it is not
+             pinned here. -->
+        <opentelemetry-proto.version>1.7.0-alpha</opentelemetry-proto.version>
+
         <!-- Quinoa is in NO BOM, so the version is pinned here rather than inherited, and it is
              pinned in the PARENT rather than beside the dependency so there is one place to read it
              from when the platform's Quarkus moves. 2.8.2 is the last release built against a
@@ -91,6 +101,11 @@
                 <groupId>org.mapstruct</groupId>
                 <artifactId>mapstruct</artifactId>
                 <version>${mapstruct.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.opentelemetry.proto</groupId>
+                <artifactId>opentelemetry-proto</artifactId>
+                <version>${opentelemetry-proto.version}</version>
             </dependency>
             <dependency>
                 <!-- The Angular client in service/src/main/webui. See the pin's reasoning at

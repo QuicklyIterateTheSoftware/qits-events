@@ -287,6 +287,51 @@ when the platform's Quarkus passes the version a release is built against.
 - A `Failed to start quarkus` / `Port already bound` failure is the known flake — `@QuarkusTest`
   restarts racing for the test port. Re-run first; `test-port=0` is why it should not happen here.
 
+## Application logs leave over OTLP
+
+`org.jboss.logging.Logger` calls become OTLP log records through Quarkus' OpenTelemetry logging
+handler, on the same exporter as traces and metrics. Nothing in this service's own code does that
+work and nothing should — the extension **is** the logging library.
+
+The arrangement is four keys in `application.properties`, and all four are spelled out even though
+three are Quarkus' own defaults, because the integration is still marked **preview**: an upgrade
+that flipped one would stop the platform's logging with a green build. `quarkus.otel.logs.level` is
+the one that is not a default — it makes INFO the outbound floor, deliberately, while console
+logging stays untouched. The OTel handler is an **additional** copy of every record, never the only
+one; stdout is the fallback that survives the receiver being down.
+
+`telemetry/OtlpLogStub` is the machinery, and it decodes rather than counts: a JDK `HttpServer` on
+an ephemeral loopback port, wired in as `quarkus.otel.exporter.otlp.endpoint`, parsing each
+`ExportLogsServiceRequest` (`io.opentelemetry.proto:opentelemetry-proto`, **test scope only** —
+compile scope would drag protobuf into the native image for nothing). It also sets
+`quarkus.otel.sdk.disabled=false`, because the shipped file turns the SDK off under `%test` so an
+ordinary suite does not retry against an unresolvable `qits-observability`.
+
+Three classes use it, and they answer different questions:
+
+- `OtelLogBridgeTest` — the decision gate, in the build JVM. Identity, both timestamps, severity
+  number *and* text, the formatted body, the throwable as `exception.type` / `exception.message` /
+  `exception.stacktrace`, and an error logged inside a real server span carrying that request's
+  trace and span ids. It also pins that the console handler is still attached beside the OTel one.
+- `PackagedLogBridgeIT` — the same claim against the **artifact**, where the handler's runtime
+  initialisation and protobuf marshalling are a different question. It runs the `prod` profile, so
+  the shipped keys are what is under test, and it asserts on records the shipped code really makes:
+  Quarkus' own startup INFO, and a genuine unhandled 500.
+- `OtelLogExporterUnreachableTest` — the exporter pointed at a closed port. Requests keep answering,
+  health stays UP, and 3000 records never block the caller.
+
+Four things there were measured rather than assumed, and each one would have been wrong from memory:
+
+- a record logged outside a span carries **absent** trace/span ids — an empty byte string, not a
+  zero-filled one;
+- `observedTime` is stamped, from a different clock than `time`, and lands microseconds either side
+  of it — their order means nothing;
+- the handler writes several more attributes (`bridge.name`, `code.function.name`,
+  `code.line.number`, `log.logger.namespace`, `thread.name`, `thread.id`). They are incubating and
+  deliberately not pinned;
+- one failure makes several records at several levels. A predicate that matches a stack trace
+  without also matching the severity picks Hibernate's WARN, not the ERROR an operator looks for.
+
 ## The image and the pipeline
 
 `docker/Dockerfile` and `.config/qits/ci-post-receive.yml` are two halves of one thing, and the seam

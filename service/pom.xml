@@ -107,6 +107,22 @@
             <artifactId>rest-assured</artifactId>
             <scope>test</scope>
         </dependency>
+        <dependency>
+            <!-- TEST ONLY, and it must stay that way. These are the OTLP wire's generated message
+                 classes, and the only thing here that reads them is telemetry/OtlpLogStub — the
+                 offline receiver the log-bridge proof decodes an ExportLogsServiceRequest with.
+                 Nothing in this service SENDS OTLP by hand: quarkus-opentelemetry marshals the wire
+                 itself, from its own internal marshallers, and does not put these classes on the
+                 compile classpath. That is the whole reason the dependency exists — without it a
+                 test can only assert that some bytes arrived, which is exactly the assertion that
+                 would keep passing if Quarkus exported an empty batch.
+
+                 Compile-scoping it would drag protobuf-java into the native image for nothing.
+                 Version pinned in the root pom (not in the platform BOM). -->
+            <groupId>io.opentelemetry.proto</groupId>
+            <artifactId>opentelemetry-proto</artifactId>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
