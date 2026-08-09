@@ -68,7 +68,7 @@ public class Event extends PanacheEntityBase {
    * still sitting in a publisher's outbox, and 400 is unretryable, so a timing accident would
    * become permanent data loss. A parent id this log cannot resolve is a true statement about
    * causation that this log has not (or no longer has) the other half of; the reader treats it as
-   * the start of a chain. See {@code V3__parent_id.sql}.
+   * the start of a chain. See {@code V1__init.sql}.
    */
   @Column(name = "parent_id")
   public String parentId;

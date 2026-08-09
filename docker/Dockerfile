@@ -20,23 +20,24 @@
 # mvnw line for why the build cannot happen inside that stage.
 #
 # --- `docker run` with no configuration FAILS, and that is the honest behaviour -------------------
-# The `events` jar defaults its datasource to file-backed H2 under `${user.home}/.qits/…`. In this
-# image `USER 1001` has no passwd entry, so `user.home` resolves to the literal `?` and the process
-# dies during Flyway's first connect with:
-#
-#     A file path that is implicitly relative to the current working directory is not allowed in the
-#     database URL "jdbc:h2:file:?/.qits/data/events/h2/events" [90011-240]
+# The `events` jar's datasource is an EXPRESSION over the platform's generic resource contract —
+# `jdbc.url=${QITS_RESOURCE_DB_URL}` and its username/password siblings — with no fallback url at
+# all. Unset, the expressions are unresolvable and the process dies during Flyway's first connect
+# naming the missing variable.
 #
 # That is a missing-configuration failure, not a packaging one, and it is deliberately NOT patched
-# here with an `ENV HOME=…`: a home dir inside the container would make the bare run "work" by
-# writing a database that dies with the container — the failure would move from the first second to
-# the first restart. What a deployment supplies instead is one variable:
+# here with an `ENV`: no address this image could name would be right on a real platform, and a
+# default would only make the bare run "work" against a store nobody meant. What a deployment
+# supplies instead is the triple:
 #
-#     QUARKUS_DATASOURCE_EVENTS_JDBC_URL=jdbc:h2:file:/data/events/h2/events
+#     QITS_RESOURCE_DB_URL=jdbc:postgresql://<tier>-qits-oci-postgresql:5432/qits_events
+#     QITS_RESOURCE_DB_USERNAME=qits_events
+#     QITS_RESOURCE_DB_PASSWORD=…
 #
-# on a volume mounted at /data/events. The H2 arrangement is a prototype and must not look decided,
-# so it refuses to start unconfigured. (Unlike qits-projects, this service owns no on-disk tree
-# besides that database — there is no second, settled path for the image to name.)
+# and nobody types those: `.config/qits/deployments.yml` declares `resources: postgresql:db`, and
+# qits-platform-deployments creates the role and the database before this container starts and
+# injects all three. This image carries no volume for data any more — the store is another
+# container's.
 #
 # Also not supplied: `qits.observability.url`, which ships as `http://qits-observability:8080` — the
 # service name on qits-net, correct for this image out of the box. On a network where that name does
@@ -145,13 +146,11 @@ WORKDIR /work
 COPY --from=build --chown=1001:root /src/service/target/qits-events /work/qits-events
 RUN chmod +x /work/qits-events
 
-# The mount point for the database, created here so it is OWNED. Docker seeds a fresh named volume
-# from whatever the image has at the mount path, ownership included; with no such directory it makes
-# one root-owned 0755 and the boot dies on an AccessDeniedException rather than on the config error,
-# which reads like a bug in this image and is not one. Group-writable and group-root because a ubi
-# image is meant to survive being assigned an arbitrary uid with gid 0. (A bind mount still takes its
-# ownership from the host — nothing in an image can change that.)
-RUN mkdir -p /data/events && chown -R 1001:root /data && chmod -R 775 /data
+# NO MOUNT POINT FOR DATA, and its absence is the change the move to PostgreSQL bought. There used
+# to be an owned `/data/events` here for the H2 file, because docker seeds a fresh named volume from
+# whatever the image has at the mount path and a missing directory made the boot die on an
+# AccessDeniedException instead of on the config error. The store is another container's now: this
+# service writes nothing to disk that outlives it, so there is no volume to own and none to back up.
 
 EXPOSE 8080
 USER 1001

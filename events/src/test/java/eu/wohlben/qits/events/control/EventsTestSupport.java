@@ -7,8 +7,8 @@ import org.junit.jupiter.api.BeforeEach;
 
 /**
  * Base for events control-layer tests: wipes the table before each test so every case starts from an
- * empty log. Runs against in-memory H2 (see src/test/resources/application.properties) — no docker,
- * no auth variant, nothing on PATH.
+ * empty log. Runs against an embedded PostgreSQL this module's suite spawns itself (see
+ * persistence/EmbeddedPg) — no docker, no auth variant, nothing on PATH.
  */
 public abstract class EventsTestSupport {
 

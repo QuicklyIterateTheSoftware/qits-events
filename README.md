@@ -267,14 +267,23 @@ does this, for the same reason.
 
 The `events` jar ships its defaults at ordinal 100
 (`events/src/main/resources/META-INF/microprofile-config.properties`); `service`'s
-`application.properties` is the app's own at 250; `.env` is 295 and real environment is 300. One
-variable is the whole of what a deployment must say about storage:
+`application.properties` is the app's own at 250; `.env` is 295 and real environment is 300.
 
-    QUARKUS_DATASOURCE_EVENTS_JDBC_URL=jdbc:h2:file:/data/events/h2/events
+Storage is **declared, not configured**. `.config/qits/deployments.yml` carries one line —
 
-The image names no default for it. An unconfigured `docker run` fails at Flyway's first connect, and
-that is the honest behaviour — a home dir baked into the image would make the bare run "work" by
-writing a database that dies with the container.
+    resources: postgresql:db
+
+— and qits-platform-deployments creates the role and the database (`qits_events`, derived from the
+application name) on the tier's PostgreSQL before the successor container starts, then injects
+
+    QITS_RESOURCE_DB_URL / QITS_RESOURCE_DB_USERNAME / QITS_RESOURCE_DB_PASSWORD
+
+which is what the jar's datasource defaults expand. Those three names are the platform's generic
+resource contract; nothing about them is events-specific.
+
+The triple has no fallback. An unconfigured `docker run` leaves the expressions unresolvable and the
+process dies at Flyway's first connect naming the missing variable — the honest behaviour, and the
+same refuse-to-boot stance the siblings take.
 
 ## Authentication
 

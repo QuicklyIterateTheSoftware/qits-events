@@ -8,15 +8,17 @@ conventions on top of it.
 **A clone of this repo alone builds and tests green** — no monorepo, no docker, no prior
 `mvn install` elsewhere, no credentials. Anything that would break that is not a tradeoff to weigh;
 it is the thing this repo exists to avoid. That is why the poms duplicate versions instead of
-inheriting them, and why every suite runs on in-memory H2.
+inheriting them, and why the suites spawn their own PostgreSQL from a Maven artifact rather than
+reaching for a container.
 
 **Which command is the gate depends on whether you have the client**, and this is worth getting
 right because the platform reference states it loosely:
 
-- `./mvnw test` — needs **neither node nor the webui submodule**. Quinoa is disabled by default in
-  test mode (it says so: `Quinoa is disabled by default in tests.`), so all 86 `@QuarkusTest`s pass
-  against an empty `webui/` on a machine with no node at all — the stream socket included, since
-  a websocket is not a Quinoa concern. Measured, not assumed.
+- `./mvnw test` — needs **neither node nor the webui submodule**, and no docker either. Quinoa is
+  disabled by default in test mode (it says so: `Quinoa is disabled by default in tests.`), so all
+  102 `@QuarkusTest`s pass against an empty `webui/` on a machine with no node at all — the stream
+  socket included, since a websocket is not a Quinoa concern. The store they run on is a real
+  postgres the suite spawns itself from a Maven artifact. Measured, not assumed.
 - `./mvnw verify` — runs `package` on its way to failsafe, and `package` is where Quinoa augments.
   So verify needs **both**, and against an uninitialised submodule it fails with
   `No package.json found in Web UI directory: 'src/main/webui'`. `docs/project-setup-quinoa-angular.md`
@@ -37,10 +39,13 @@ Two consequences worth stating before you reach for a dependency:
   the failure lands at *runtime* in the binary while the JVM suite stays green. Prefer what is
   already in the image — `ProcessBuilder` over a process library, `java.lang.foreign` over JNA.
 
-The one native-image trap this repo has already inherited by *not* doing it: **never put
-`AUTO_SERVER=TRUE` on the H2 url.** It makes H2 start its own TCP server, whose class a native image
-loads by name and therefore does not have; the binary dies in connection-pool warm-up before it binds
-a port, and every JVM run stays green. It cost qits-ci and qits-projects a release each.
+The one native-image trap this repo inherited by *not* doing it was the H2 `AUTO_SERVER=TRUE` flag:
+a feature in a shipped datasource default whose class a native image loads by name and therefore does
+not have, killing the binary in connection-pool warm-up while every JVM run stayed green. It cost
+qits-ci and qits-projects a release each. **The lesson outlived the url** and now reads: every config
+default the app boots with is part of the native surface. Today's datasource ships an *expression*
+over `QITS_RESOURCE_DB_*` and no fallback url at all, so there is no longer a default with a feature
+in it to lose — which is a smaller surface, not an exemption.
 
 ## Package and module conventions
 
@@ -151,7 +156,7 @@ Three things about it are load-bearing here:
   deliberately **no existence check and no FK**: nothing orders a parent's arrival before its
   child's, and 400 is unretryable, so a check would turn a publisher's timing accident into
   permanent data loss. A dangling parent is data. The reasoning is written where the check would
-  otherwise live (`EventService.causeOf`) and in `V3__parent_id.sql`; if a future change makes it
+  otherwise live (`EventService.causeOf`) and beside the column in `V1__init.sql`; if a future change makes it
   look like an oversight, read those first.
 - **The field is on the wire as an explicit `null`.** Absent-means-null is the contract's one
   backward-compatibility clause (an older publisher keeps working), but this service always *emits*
@@ -225,6 +230,18 @@ characters ahead of a template so it wins, but that is a spec guarantee being le
 `EventApiTest` and `PackagedSurfaceIT` both assert it. Everything here stays under `/events/api`, so
 `quarkus.quinoa.ignored-path-prefixes` is untouched — check that again before adding a route.
 
+## The store
+
+**It is PostgreSQL, and it is declared rather than configured.** `.config/qits/deployments.yml`
+carries `resources: postgresql:db`; qits-platform-deployments creates the role and the database
+(`qits_events` — the default derivation: the application name minus its `qits-` prefix, under a
+`qits_` prefix) on the tier's postgres before the successor container starts, and injects
+`QITS_RESOURCE_DB_URL` / `_USERNAME` / `_PASSWORD`. The events jar's shipped defaults expand exactly
+those three names, and **nothing else**: there is no fallback url, so an unset variable leaves the
+expression unresolvable and the process dies at Flyway naming the missing name rather than opening a
+store nobody meant. That triple is the platform's *generic* contract — nothing in it is
+events-specific, which is what keeps the deployer framework-agnostic.
+
 ## Schema changes
 
 `events/src/main/resources/db/events/migration/`, hand-written, its own lineage on its own
@@ -232,6 +249,21 @@ datasource. Entities live in a **named** persistence unit (`events`), not the de
 no default datasource in this app at all, which is why
 `quarkus.hibernate-orm.events.packages` is set: without it an entity has no unit to belong to and
 the boot fails naming neither.
+
+**The lineage restarted at V1 when the store moved off H2.** The five H2 migrations were deleted
+rather than continued, and that was a decision with one precondition: the move onto postgres is an
+**unwrap and a re-bootstrap**, so no database anywhere was left on the old lineage and no
+`V6__move_to_postgres.sql` would have had a reader. The fresh `V1__init.sql` is those five
+translated — `clob` → `text`, the V2 and V3 columns declared in the table instead of added to it,
+V5's index created beside V1's and V3's — minus V4, whose `delete from Event` removed three rows of
+a database that no longer exists and would now only read as an instruction. The entity moved with
+none of it: it names no `columnDefinition`, so there was nothing to keep in step. **A second clean
+start is not a precedent** — it cost a re-bootstrap, and the ordinary rule (append, never edit an
+applied migration) is back from V1 onward.
+
+The table is `event`, unquoted. PostgreSQL folds an unquoted identifier to lower case and so does
+Hibernate's naming strategy for the entity `Event`, so the two agree without a quote in either
+place — where H2 folded both to upper case and agreed the other way.
 
 ## Dependencies
 
@@ -253,7 +285,18 @@ when the platform's Quarkus passes the version a release is built against.
   so `quarkus.rest.path` and the rest are already in effect. Never re-declare them in
   `src/test/resources/application.properties`: a test copy is free to drift from the shipped one,
   and then a green suite proves nothing about what actually starts. That file is for genuine
-  test-only overrides (in-memory H2, `clean-at-start`, the test port).
+  test-only overrides (the persistence-unit wiring, `clean-at-start`, the test port,
+  `quarkus.devservices.enabled=false`).
+- **No dev services and no containers, ever.** A dev service is a container start, and the first
+  rule here is that a clone tests green with no docker. The store being postgres does not change
+  that answer: `EmbeddedPg` starts **zonky's** postgres — real binaries resolved as Maven artifacts,
+  spawned as a child process — and `EmbeddedPgConfigSource` hands its url, username and password to
+  every `@QuarkusTest` at an ordinal above `application.properties`, because the port is chosen at
+  run time and cannot be written into a file. Both are **copied** per module (`events`'
+  `persistence/`, `service`'s `testdb/`) rather than shared: a test-jar dependency between two
+  modules that have none is the higher price. Each module names its own database (`events_test`,
+  `events_svc`) so two suites cannot mean the same one. Testcontainers is not on this classpath and
+  must not arrive.
 - **`quarkus.http.test-port=0`, deliberately.** Quarkus' default test port is 8081, which on the
   deployment host is the published address of the platform's own npm registry — so the default makes
   the entire suite fail with `Port already bound: 8081` on the one machine this repo is most likely
@@ -279,13 +322,18 @@ when the platform's Quarkus passes the version a release is built against.
   sees the client.** Quinoa is disabled in test mode, so no `@QuarkusTest` here has a client in it at
   all — a unit test asserting anything about `/events/` would pass against a process serving nothing.
   Every `@QuarkusTest` also augments in the build JVM, with the whole classpath present, reflection
-  unrestricted and an in-memory H2; a native image has none of those. It runs under `-Dnative`, and
-  `-DskipITs=false` runs it against the fast-jar:
+  unrestricted and a datasource handed to it by a config source; a native image has none of those.
+  It runs under `-Dnative`, and `-DskipITs=false` runs it against the fast-jar:
 
       ./mvnw -B -ntp verify -DskipITs=false
 
-  It relocates `user.home` under `target/` rather than restating the JDBC url, so the **shipped**
-  `${user.home}`-rooted url is itself what gets exercised.
+  It hands the launched process `QITS_RESOURCE_DB_URL` and its two siblings — the generic contract a
+  deployment supplies — rather than restating the datasource keys, so the jar's own `${…}`
+  indirection is what is under test, and it reads the written row back over JDBC to prove which
+  database the process really opened. `PackagedLogBridgeIT` does the same on a database of its own,
+  because a process with no store dies at Flyway before it logs anything worth reading. Both reach
+  their embedded postgres through a **system property**, because a `QuarkusTestProfile` is
+  instantiated in more than one classloader and a static field is not shared between them.
 - **The probe list is the platform's**, from `docs/project-setup-quinoa-angular.md` in the
   superproject, and any change touching the Quinoa setup re-runs it: `/events/` → 200 HTML with the
   right `<base href>`; a deep link → 200 `index.html`; `/events/api/<real>` → the API's own answer;

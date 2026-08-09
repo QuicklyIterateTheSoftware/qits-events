@@ -6,16 +6,18 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import eu.wohlben.qits.events.stream.FakeSubscriber;
+import eu.wohlben.qits.events.testdb.EmbeddedPg;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusIntegrationTest;
 import io.quarkus.test.junit.QuarkusTestProfile;
 import io.quarkus.test.junit.TestProfile;
 import io.restassured.http.ContentType;
 import java.net.URI;
-import java.nio.file.Files;
-import java.nio.file.Path;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.time.Duration;
-import java.util.Comparator;
 import java.util.Map;
 import java.util.UUID;
 import org.junit.jupiter.api.Test;
@@ -26,8 +28,8 @@ import org.junit.jupiter.api.Test;
  * whole class of failure is visible.
  *
  * <p>Every other test here is a {@code @QuarkusTest}: it augments and runs in the build JVM, with
- * the full classpath present, reflection unrestricted, an in-memory H2 — and, crucially, <b>Quinoa
- * disabled</b>. Quinoa is off by default in test mode, so no {@code @QuarkusTest} in this repo has
+ * the full classpath present, reflection unrestricted, its datasource keys handed to it by a config
+ * source — and, crucially, <b>Quinoa disabled</b>. Quinoa is off by default in test mode, so no {@code @QuarkusTest} in this repo has
  * ever seen the client at all; a unit test asserting something about {@code /events/} would pass
  * against a process with no client in it. What the SPA is actually served as is proven here or
  * nowhere.
@@ -60,19 +62,41 @@ import org.junit.jupiter.api.Test;
 public class PackagedSurfaceIT {
 
   /**
-   * Relocates the launched artifact's state under {@code target/} by moving {@code user.home}, not
-   * by restating the settings — the events jar's datasource default is {@code ${user.home}}-rooted,
-   * so overriding {@code user.home} leaves the <b>shipped</b> JDBC URL itself under test (the
-   * AUTO_SERVER lesson: a url that a JVM opens happily and a native image dies on). Without this the
-   * IT would migrate into the developer's real {@code ~/.qits}.
+   * Hands the launched artifact a database the way a deployment does — as the generic resource
+   * triple, not as the datasource keys. The events jar ships {@code
+   * jdbc.url=${QITS_RESOURCE_DB_URL}} and its two siblings, so supplying the variables leaves the
+   * <b>shipped</b> expression itself under test (the AUTO_SERVER lesson, applied to what replaced
+   * that URL). Expression expansion reads the whole config, and these overrides reach the launched
+   * process as system properties, so the same three names resolve.
+   *
+   * <p>The database is an embedded postgres this JVM starts, on a name of its own so this IT and
+   * {@code PackagedLogBridgeIT} cannot write into each other's schema. <b>Its url travels through a
+   * system property rather than a static field</b>: a test profile is instantiated in more than one
+   * classloader, so a field written by one copy is not the field the other reads, while the process
+   * has exactly one property table.
    */
   public static class PackagedUnderTarget implements QuarkusTestProfile {
-    static final Path HOME = Path.of("target", "events-packaged-it-home").toAbsolutePath();
+
+    /** Where the url is parked for whichever copy of this class is asked second. */
+    private static final String URL_PROPERTY = "qits.test.packaged-surface-it.db-url";
 
     @Override
     public Map<String, String> getConfigOverrides() {
-      deleteRecursively(HOME);
-      return Map.of("user.home", HOME.toString());
+      return Map.of(
+          "QITS_RESOURCE_DB_URL", databaseUrl(),
+          "QITS_RESOURCE_DB_USERNAME", EmbeddedPg.USER,
+          "QITS_RESOURCE_DB_PASSWORD", EmbeddedPg.PASSWORD);
+    }
+
+    private static synchronized String databaseUrl() {
+      String recorded = System.getProperty(URL_PROPERTY);
+      if (recorded != null) {
+        return recorded;
+      }
+      // localhost resolves for the launched process too — it is a child of this JVM on this host.
+      String url = EmbeddedPg.url("events_packaged_it");
+      System.setProperty(URL_PROPERTY, url);
+      return url;
     }
   }
 
@@ -265,12 +289,27 @@ public class PackagedSurfaceIT {
         .statusCode(200)
         .body("event.name", org.hamcrest.Matchers.equalTo("Packaged surface"));
 
-    // The round trip above would look identical against an in-memory database, so pin that the
-    // process really opened the ${user.home}-rooted file H2 the events jar ships — a migration is
-    // loaded by scanning a classpath location, exactly the shape a native image drops.
-    assertTrue(
-        Files.isDirectory(PackagedUnderTarget.HOME.resolve(".qits/data/events/h2")),
-        "the shipped file-H2 default must be what the packaged process opened");
+    // The round trip above would look identical against any database at all, so read the row back
+    // out of the postgres this JVM handed the process through ${QITS_RESOURCE_DB_URL}. That is the
+    // whole claim: the shipped expression resolved, Flyway's migration survived as a classpath
+    // resource (exactly the shape a native image drops), and the table it created is the one the
+    // request wrote into.
+    assertTrue(rowExists(id), "the packaged process must have written into the resource database");
+  }
+
+  private static boolean rowExists(String id) {
+    String url = EmbeddedPg.url("events_packaged_it");
+    try (Connection connection =
+            DriverManager.getConnection(url, EmbeddedPg.USER, EmbeddedPg.PASSWORD);
+        PreparedStatement query =
+            connection.prepareStatement("select 1 from event where id = ?")) {
+      query.setString(1, id);
+      try (ResultSet found = query.executeQuery()) {
+        return found.next();
+      }
+    } catch (Exception e) {
+      throw new IllegalStateException("could not read the resource database back", e);
+    }
   }
 
   @Test
@@ -337,8 +376,8 @@ public class PackagedSurfaceIT {
   @Test
   public void theIdempotentPublishAnswersTwoOhOneThenTwoHundredThenFourHundred() {
     // On the artifact rather than only in a @QuarkusTest, because this is also the only place the
-    // V2 payload and V3 parent_id columns are exercised against the SHIPPED file-H2 through
-    // Flyway's real migration resources — the shape a native image drops silently.
+    // payload and parent_id columns are exercised against the provisioned database through Flyway's
+    // real migration resources — the shape a native image drops silently.
     //
     // The envelope carries parentId here for exactly that reason: a migration that never ran, a
     // column MapStruct maps by a name the native image dropped, or an omit-nulls mapper are all
@@ -432,16 +471,5 @@ public class PackagedSurfaceIT {
         .statusCode(200)
         .body("event", org.hamcrest.Matchers.hasKey("parentId"))
         .body("event.parentId", org.hamcrest.Matchers.nullValue());
-  }
-
-  private static void deleteRecursively(Path root) {
-    if (!Files.exists(root)) {
-      return;
-    }
-    try (var walk = Files.walk(root)) {
-      walk.sorted(Comparator.reverseOrder()).forEach(p -> p.toFile().delete());
-    } catch (Exception e) {
-      throw new IllegalStateException("could not clear " + root, e);
-    }
   }
 }

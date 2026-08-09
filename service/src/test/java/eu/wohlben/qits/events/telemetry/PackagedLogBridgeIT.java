@@ -6,17 +6,17 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import eu.wohlben.qits.events.telemetry.OtlpLogStub.Captured;
+import eu.wohlben.qits.events.testdb.EmbeddedPg;
 import io.quarkus.test.common.WithTestResource;
 import io.quarkus.test.junit.QuarkusIntegrationTest;
 import io.quarkus.test.junit.QuarkusTestProfile;
 import io.quarkus.test.junit.TestProfile;
 import io.restassured.http.ContentType;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.time.Duration;
-import java.util.Comparator;
 import java.util.Map;
 import java.util.Optional;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -54,23 +54,47 @@ import org.junit.jupiter.api.Test;
 public class PackagedLogBridgeIT {
 
   /**
-   * The same {@code user.home} relocation {@code PackagedSurfaceIT} makes, into a directory of its
-   * own so the two ITs cannot clear each other's database mid-run: the events jar's shipped JDBC url
-   * is {@code ${user.home}}-rooted, and without this the launched process would migrate into the
-   * developer's real {@code ~/.qits}.
+   * The same arrangement {@code PackagedSurfaceIT} makes — the launched process is handed {@code
+   * QITS_RESOURCE_DB_URL} and its two siblings, which is what the events jar's shipped datasource
+   * defaults expand — on a database of its own so the two ITs cannot write into each other's
+   * schema. Without it the process has no store at all and dies at Flyway before it logs anything
+   * this IT could read.
+   *
+   * <p>The url travels through a <b>system property</b> rather than a static field: a test profile
+   * is instantiated in more than one classloader, so a field written by one copy is not the field
+   * the other reads, while the process has exactly one property table.
    */
   public static class PackagedUnderTarget implements QuarkusTestProfile {
-    static final Path HOME = Path.of("target", "events-log-bridge-it-home").toAbsolutePath();
+
+    /** Where the url is parked for whichever copy of this class is asked second. */
+    private static final String URL_PROPERTY = "qits.test.log-bridge-it.db-url";
 
     @Override
     public Map<String, String> getConfigOverrides() {
-      deleteRecursively(HOME);
-      return Map.of("user.home", HOME.toString());
+      return Map.of(
+          "QITS_RESOURCE_DB_URL", databaseUrl(),
+          "QITS_RESOURCE_DB_USERNAME", EmbeddedPg.USER,
+          "QITS_RESOURCE_DB_PASSWORD", EmbeddedPg.PASSWORD);
+    }
+
+    private static synchronized String databaseUrl() {
+      String recorded = System.getProperty(URL_PROPERTY);
+      if (recorded != null) {
+        return recorded;
+      }
+      // localhost resolves for the launched process too — it is a child of this JVM on this host.
+      String url = EmbeddedPg.url("events_log_bridge_it");
+      System.setProperty(URL_PROPERTY, url);
+      return url;
     }
   }
 
   /** The launched process exports on its own schedule; every wait here is a deadline. */
   private static final Duration ARRIVAL = Duration.ofSeconds(30);
+
+  /** Quarkus' per-failure id: a UUID with a request counter appended. */
+  private static final Pattern ERROR_ID =
+      Pattern.compile("[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}-\\d+");
 
   @Test
   public void theArtifactShipsItsOrdinaryLogRecordsOverOtlp() {
@@ -106,31 +130,38 @@ public class PackagedLogBridgeIT {
     // logged by the server at ERROR with the throwable, from inside the request's span. Marshalling
     // a throwable into exception.* attributes and reading the ambient trace context are precisely
     // the two things a native image could quietly stop doing.
-    String marker = "packaged-log-bridge-" + System.nanoTime();
-    given()
-        .contentType(ContentType.JSON)
-        .body(
-            "{\"name\":\""
-                + marker
-                + "x".repeat(600)
-                + "\",\"occurredAt\":\"2026-08-05T09:00:00Z\"}")
-        .when()
-        .post("/events/api/events")
-        .then()
-        .statusCode(500);
+    String body =
+        given()
+            .contentType(ContentType.JSON)
+            .body("{\"name\":\"" + "x".repeat(600) + "\",\"occurredAt\":\"2026-08-05T09:00:00Z\"}")
+            .when()
+            .post("/events/api/events")
+            .then()
+            .statusCode(500)
+            .extract()
+            .asString();
+
+    // THE ERROR ID IS THE CORRELATION, and it has to be: the request used to plant a marker string
+    // in the over-long name and match it inside the stack trace, which worked only because H2 echoed
+    // the rejected VALUE in its message. PostgreSQL says `value too long for type character
+    // varying(512)` and names no value, so the marker never reaches a log record. The id Quarkus
+    // mints per failure is in both halves — the response body and QuarkusErrorHandler's own line —
+    // so it ties the record to THIS request rather than to a leftover of an earlier one.
+    Matcher id = ERROR_ID.matcher(body);
+    assertTrue(id.find(), "the 500 carried no error id to correlate on; body was: " + body);
+    String errorId = id.group();
 
     // MEASURED: one failure makes SEVERAL records, and the severity is what tells them apart. Two
     // Hibernate/Arjuna WARNs (severity 13) carry the same stack trace, and the ERROR (17) is
     // QuarkusErrorHandler's "HTTP Request to ... failed, error id: …" — the record an operator's
-    // errors feed shows. So the predicate matches on severity as well as on the marker; matching on
-    // the marker alone picks a WARN and quietly proves less.
+    // errors feed shows. So the predicate matches on severity as well as on the id; matching on the
+    // message alone picks a WARN and quietly proves less.
     Captured error =
         OtlpLogStub.await(
                 c ->
                     c.record().getSeverityNumber().getNumber() == 17
-                        && c.attribute("exception.stacktrace")
-                            .filter(s -> s.contains(marker))
-                            .isPresent(),
+                        && c.body().contains(errorId)
+                        && c.attribute("exception.stacktrace").isPresent(),
                 ARRIVAL)
             .orElseThrow(
                 () ->
@@ -158,16 +189,5 @@ public class PackagedLogBridgeIT {
         error.traceId(),
         "an error logged inside a request must carry its trace id; " + OtlpLogStub.describe());
     assertNotEquals("", error.spanId(), "an error logged inside a request must carry its span id");
-  }
-
-  private static void deleteRecursively(Path root) {
-    if (!Files.exists(root)) {
-      return;
-    }
-    try (var walk = Files.walk(root)) {
-      walk.sorted(Comparator.reverseOrder()).forEach(p -> p.toFile().delete());
-    } catch (Exception e) {
-      throw new IllegalStateException("could not clear " + root, e);
-    }
   }
 }

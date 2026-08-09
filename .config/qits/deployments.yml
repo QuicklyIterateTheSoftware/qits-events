@@ -10,3 +10,16 @@
 # ENVIRONMENT service: every environment runs its own instance, and a green build deploys into
 # whichever tier listens to the built branch.
 deployment_target: environment
+
+# THE STORE, DECLARED RATHER THAN CONFIGURED. This service's log is PostgreSQL, and the line below
+# is what provisions it: a role and a database of its own on the tier's postgres, created before the
+# successor container starts and injected as QITS_RESOURCE_DB_URL / _USERNAME / _PASSWORD — the
+# generic contract the events jar's datasource defaults read verbatim.
+#
+# The third segment is omitted, so the database is the default derivation: the application name
+# minus its `qits-` prefix, dashes to underscores, under a `qits_` prefix — `qits_events`. Spelling
+# it out would be a second place for one answer to be wrong in.
+#
+# Provisioning is idempotent and the credential lives in the deployer's registry, so a redeploy
+# finds the existing row and injects the password this process is already connected with.
+resources: postgresql:db

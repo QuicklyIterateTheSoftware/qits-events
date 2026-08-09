@@ -45,8 +45,8 @@ public class EventRepository implements PanacheRepositoryBase<Event, String> {
       parameters.and("since", query.since());
     }
     if (query.search() != null) {
-      // The payload is a clob the server treats as opaque, so this is a scan and no index can help
-      // it — see V5__event_query_indexes.sql for why that is the honest answer at this table's size.
+      // The payload is text the server treats as opaque, so this is a scan and no index can help
+      // it — see V1__init.sql for why that is the honest answer at this table's size.
       clauses.add("lower(payload) like :search escape '!'");
       parameters.and("search", query.search());
     }
