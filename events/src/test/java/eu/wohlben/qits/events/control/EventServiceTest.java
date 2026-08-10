@@ -183,6 +183,169 @@ class EventServiceTest extends EventsTestSupport {
   }
 
   @Test
+  void ascendingWalksTheWholeLogOldestFirstAndTheLastPageSaysSo() {
+    // The catch-up direction: a durable consumer resumes from the last row it handled and reads
+    // FORWARD to the head. The same walk as the descending one above, turned round — same cursor
+    // value, same end-of-log signal, opposite order.
+    for (int i = 1; i <= 5; i++) {
+      eventService.create(
+          "Row " + i, Instant.parse("2026-0" + i + "-01T00:00:00Z"), null, null, null);
+    }
+
+    List<String> walked = new java.util.ArrayList<>();
+    EventCursor cursor = null;
+    EventService.EventPage page;
+    do {
+      String from = cursor == null ? null : cursor.format();
+      page = eventService.list(EventQuery.of(null, null, null, from, "2", List.of(), "asc"));
+      page.events().forEach(e -> walked.add(e.name));
+      cursor = page.nextCursor();
+    } while (cursor != null);
+
+    assertEquals(List.of("Row 1", "Row 2", "Row 3", "Row 4", "Row 5"), walked);
+    assertEquals(1, page.events().size());
+    assertNull(page.nextCursor());
+  }
+
+  @Test
+  void ascendingResumesStrictlyAfterTheWatermarkRowItWasHandedBack() {
+    // What a consumer's watermark actually is: the cursor of the page it finished. Sent back
+    // verbatim it must yield the NEXT row, never the one it names again — a repeat would be handled
+    // twice by anything without its own dedupe, and a skip would be a lost event.
+    for (int i = 1; i <= 3; i++) {
+      eventService.create(
+          "Row " + i, Instant.parse("2026-0" + i + "-01T00:00:00Z"), null, null, null);
+    }
+
+    EventService.EventPage first =
+        eventService.list(EventQuery.of(null, null, null, null, "1", List.of(), "asc"));
+    assertEquals(List.of("Row 1"), names(first));
+    EventCursor watermark = first.nextCursor();
+    assertNotNull(watermark);
+    assertEquals(first.events().get(0).id, watermark.id());
+    assertEquals(first.events().get(0).occurredAt, watermark.occurredAt());
+
+    // The same watermark twice gives the same answer: nothing here is consumed by reading it.
+    String from = watermark.format();
+    assertEquals(
+        List.of("Row 2"),
+        names(eventService.list(EventQuery.of(null, null, null, from, "1", List.of(), "asc"))));
+    assertEquals(
+        List.of("Row 2", "Row 3"),
+        names(eventService.list(EventQuery.of(null, null, null, from, "9", List.of(), "asc"))));
+  }
+
+  @Test
+  void anAscendingPageBoundaryOnATieSplitsItWithoutDroppingOrRepeatingASibling() {
+    // The whole reason the cursor is composite, in the direction catch-up reads: the boundary falls
+    // INSIDE a fork, whose siblings share the run's finish instant to the microsecond. A scalar
+    // `after=<occurredAt>` would skip the second sibling (strictly newer) or repeat the first
+    // (newer or equal). The flipped composite predicate resumes after a ROW.
+    Instant tie = Instant.parse("2026-08-01T08:52:23.928965Z");
+    Event oldest =
+        eventService.create("Oldest", Instant.parse("2026-08-01T08:00:00Z"), null, null, null);
+    Event forkA = eventService.create("Fork", tie, null, null, null);
+    Event forkB = eventService.create("Fork", tie, null, null, null);
+    Event newest =
+        eventService.create("Newest", Instant.parse("2026-08-01T09:00:00Z"), null, null, null);
+
+    EventService.EventPage first =
+        eventService.list(EventQuery.of(null, null, null, null, "2", List.of(), "asc"));
+    assertEquals(2, first.events().size());
+    assertEquals(oldest.id, first.events().get(0).id);
+    // The second row is one of the two siblings — whichever has the smaller id, since the id half of
+    // the sort turns round with the instant half — and the cursor carries it beside the shared
+    // instant.
+    String siblingOnPageOne = first.events().get(1).id;
+    assertTrue(siblingOnPageOne.equals(forkA.id) || siblingOnPageOne.equals(forkB.id));
+    assertNotNull(first.nextCursor());
+    assertEquals(tie, first.nextCursor().occurredAt());
+    assertEquals(siblingOnPageOne, first.nextCursor().id());
+
+    EventService.EventPage second =
+        eventService.list(
+            EventQuery.of(null, null, null, first.nextCursor().format(), "2", List.of(), "asc"));
+    List<String> both = new java.util.ArrayList<>();
+    first.events().forEach(e -> both.add(e.id));
+    second.events().forEach(e -> both.add(e.id));
+
+    assertEquals(4, both.size(), "four rows, each exactly once, across the tie: " + both);
+    assertEquals(4, java.util.Set.copyOf(both).size(), "no row may appear twice: " + both);
+    assertTrue(both.contains(forkA.id) && both.contains(forkB.id), "neither sibling may be dropped");
+    assertTrue(both.contains(newest.id));
+    assertNull(second.nextCursor());
+  }
+
+  @Test
+  void ascendingIsTheDescendingReadingReversedAndNothingElse() {
+    // One log, two directions, the same rows: the property that makes a catch-up consumer and the
+    // SPA agree about what history is.
+    Instant tie = Instant.parse("2026-08-01T08:52:23.928965Z");
+    Event forkA = eventService.create("Fork", tie, null, null, null);
+    Event forkB = eventService.create("Fork", tie, null, null, null);
+    eventService.create("Newest", Instant.parse("2026-08-01T09:00:00Z"), null, null, null);
+    eventService.create("Oldest", Instant.parse("2026-08-01T08:00:00Z"), null, null, null);
+
+    List<String> newestFirst =
+        ids(eventService.list(EventQuery.of(null, null, null, null, null, List.of(), "desc")));
+    List<String> oldestFirst =
+        ids(eventService.list(EventQuery.of(null, null, null, null, null, List.of(), "asc")));
+
+    assertEquals(newestFirst.reversed(), oldestFirst);
+    // ... including the tied pair, whose order the id decides in both directions: the sort's id half
+    // turns round with its instant half, so the smaller id comes first ascending. Without that the
+    // reversal above would hold only by luck.
+    List<String> siblingsAscending =
+        oldestFirst.stream().filter(id -> id.equals(forkA.id) || id.equals(forkB.id)).toList();
+    assertEquals(siblingsAscending.stream().sorted().toList(), siblingsAscending);
+  }
+
+  @Test
+  void ascendingComposesWithTheNameAndSinceFilters() {
+    // Catch-up is a filtered read: a consumer subscribes to a handful of names and starts from a
+    // watermark, so the direction has to compose with every filter rather than replace them.
+    eventService.create("BuildSuccessful", Instant.parse("2026-08-01T09:00:00Z"), null, null, null);
+    eventService.create("SCMRelease", Instant.parse("2026-08-01T09:00:01Z"), null, null, null);
+    eventService.create("BuildSuccessful", Instant.parse("2026-08-01T09:00:02Z"), null, null, null);
+    eventService.create("BuildSuccessful", Instant.parse("2026-07-01T09:00:00Z"), null, null, null);
+
+    assertEquals(
+        3,
+        eventService
+            .list(EventQuery.of("BuildSuccessful", null, null, null, null, List.of(), "asc"))
+            .events()
+            .size());
+    // since is still an inclusive lower bound, which in this direction is where the page starts.
+    EventService.EventPage page =
+        eventService.list(
+            EventQuery.of(
+                "BuildSuccessful", "2026-08-01T09:00:00Z", null, null, null, List.of(), "asc"));
+    assertEquals(List.of("BuildSuccessful", "BuildSuccessful"), names(page));
+    assertEquals(Instant.parse("2026-08-01T09:00:00Z"), page.events().get(0).occurredAt);
+    assertEquals(Instant.parse("2026-08-01T09:00:02Z"), page.events().get(1).occurredAt);
+  }
+
+  @Test
+  void anUnknownOrderIsAFourHundredAndAbsentIsNewestFirst() {
+    // order is a parameter this service defined, so a misspelling is a client error worth naming —
+    // and answering it with the OPPOSITE direction would hand a catch-up consumer the head of the
+    // log and let it record a watermark it never reached.
+    assertThrows(
+        BadRequestException.class,
+        () -> EventQuery.of(null, null, null, null, null, List.of(), "sideways"));
+    assertEquals(EventOrder.DESC, EventOrder.parse(null));
+    assertEquals(EventOrder.DESC, EventOrder.parse("  "));
+    assertEquals(EventOrder.DESC, EventOrder.parse("desc"));
+    // Case is not part of the vocabulary: the two spellings could not mean different things.
+    assertEquals(EventOrder.ASC, EventOrder.parse("ASC"));
+    assertEquals(EventOrder.ASC, EventOrder.parse(" asc "));
+    // Absent is byte-for-byte what the route always answered.
+    assertEquals(
+        EventQuery.of(null, null, null, null, null),
+        EventQuery.of(null, null, null, null, null, List.of(), "desc"));
+  }
+
+  @Test
   void theNameFilterTakesOneNameOrACommaSeparatedSet() {
     // The same vocabulary the stream's subscribe frame uses, so a filter means one thing live and
     // one thing historically.
@@ -355,6 +518,10 @@ class EventServiceTest extends EventsTestSupport {
 
   private static List<String> names(EventService.EventPage page) {
     return page.events().stream().map(e -> e.name).toList();
+  }
+
+  private static List<String> ids(EventService.EventPage page) {
+    return page.events().stream().map(e -> e.id).toList();
   }
 
   @Test

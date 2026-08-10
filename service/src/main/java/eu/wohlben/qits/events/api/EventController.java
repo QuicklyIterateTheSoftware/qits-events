@@ -77,6 +77,14 @@ public class EventController {
    *       history while the client believed it had asked for ten rows.
    *   <li>{@code ?cursor=<occurredAt>,<id>} — resume after the previous page's last row. Composite
    *       because {@code occurredAt} ties; see {@code EventCursor}.
+   *   <li>{@code ?order=asc} — oldest first. Absent or {@code desc} is the reading this route has
+   *       always answered, byte for byte. Ascending exists for <b>durable consumers catching up</b>:
+   *       a consumer that keeps the last row it handled as a watermark reads <em>forward</em> from
+   *       it until it reaches the head, which descending cannot express. The cursor is the same
+   *       value in both directions — the page's last row — and the comparison flips with the sort,
+   *       so a tie splits across a page boundary exactly as safely; see {@code EventOrder}. Anything
+   *       that is neither spelling is a 400 naming the parameter, because answering with the
+   *       opposite direction would let a catch-up consumer record a watermark it never reached.
    *   <li>{@code ?name=A,B} — the same vocabulary the stream's subscribe frame uses, so a filter
    *       means one thing live and historically. {@code GET /events/names} lists it.
    *   <li>{@code ?since=} — an inclusive lower bound on {@code occurredAt}. There is no upper bound
@@ -109,11 +117,12 @@ public class EventController {
       @QueryParam("q") String q,
       @QueryParam("attr") List<String> attr,
       @QueryParam("cursor") String cursor,
+      @QueryParam("order") String order,
       @QueryParam("limit") String limit) {
     if (parentId != null && !parentId.isBlank()) {
       return new ListEventsRequest.Response(toDtos(eventService.listChildrenOf(parentId)), null);
     }
-    var page = eventService.list(EventQuery.of(name, since, q, cursor, limit, attr));
+    var page = eventService.list(EventQuery.of(name, since, q, cursor, limit, attr, order));
     return new ListEventsRequest.Response(
         toDtos(page.events()),
         page.nextCursor() == null ? null : page.nextCursor().format());

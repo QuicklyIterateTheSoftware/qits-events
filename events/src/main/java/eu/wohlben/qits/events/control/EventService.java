@@ -56,12 +56,15 @@ public class EventService {
    * <p>The cursor is <b>the page's own last row</b> rather than a token this service remembers:
    * nothing is stored, nothing expires, and a client that keeps a cursor for a week resumes exactly
    * where it stopped. An append-only log makes that safe — rows arrive at the head, and a walk
-   * downwards can only be overtaken, never invalidated.
+   * downwards can only be overtaken, never invalidated. It is the page's last row in <b>either</b>
+   * direction, which is what lets a catch-up consumer keep it as a watermark and send it back
+   * verbatim: ascending, the rows it has not seen are the ones after it.
    */
   public record EventPage(List<Event> events, EventCursor nextCursor) {}
 
   /**
-   * One page of the log, newest first.
+   * One page of the log, in the direction the query asks for — newest first unless it says {@code
+   * asc}.
    *
    * <p>The repository is asked for one row more than the page holds. If it comes back, there is more
    * history and the page's last row becomes the next cursor; if it does not, the client has reached

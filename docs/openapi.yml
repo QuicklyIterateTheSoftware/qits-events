@@ -119,6 +119,10 @@ paths:
         in: query
         schema:
           type: string
+      - name: order
+        in: query
+        schema:
+          type: string
       - name: parentId
         in: query
         schema:
@@ -234,4 +238,4 @@ paths:
       - Event Controller
 info:
   title: qits-events API
-  version: 2026.803.170350
+  version: 2026.807.123727

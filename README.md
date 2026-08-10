@@ -151,9 +151,9 @@ which *replaces* that connection's set; `["*"]` means everything — and is then
 event. `name` doubles as the **signature** a subscriber matches on. The field *order* is not part of
 the contract — both sides bind by name — but appending is: a subscriber built against the first five
 fields reads the frame it always read. Live only, at-most-once: no replay, no offset, no catch-up.
-That is a deliberate omission rather than a gap — catch-up reads the event log itself and is a
-separate feature — and the envelope carries the id precisely so it can be built without breaking
-anyone.
+That is a deliberate omission rather than a gap — catch-up reads the event log itself, with
+`?order=asc` from the last row the consumer handled — and the envelope carries the id precisely so a
+consumer can tell a caught-up row from a live one it already has.
 
 ## Walking a chain
 
@@ -175,7 +175,7 @@ commit. This is the one addition that needs none, so this feature does not touch
 ## Reading the log
 
     GET /events/api/events?limit=200&cursor=<occurredAt>,<id>&name=A,B&since=<instant>&q=<text>
-                          &attr=<key>=<value>&attr=<key>=<value>
+                          &attr=<key>=<value>&attr=<key>=<value>&order=asc|desc
     GET /events/api/events/names   → { "names": ["BuildSuccessful", "SCMRelease", …] }
 
 The list answers a **page**, and its envelope grew one field:
@@ -197,6 +197,7 @@ shipped, so a consumer that never reads it reads the list it always read.
 | `since` | inclusive lower bound on `occurredAt`. There is deliberately no `until`: the cursor **is** the upper bound |
 | `q` | case-insensitive substring of the payload |
 | `attr` | repeatable `key=value`, ANDed. An exact, case-insensitive match of the fragment `"key":"value"` in the payload — string-valued keys of events published through `CanonicalJson` only, and, like `q`, a scan rather than an indexed lookup. A value with no `=` is a `400` naming the parameter |
+| `order` | `asc` (oldest first) or `desc`. Absent is `desc`, the reading this route has always answered. Anything else is a `400` naming the parameter |
 
 **The cursor is composite, and that is the whole design of it.** `occurredAt` is not unique and
 cannot be made unique — the events one pipeline run publishes carry the run's finish instant, so a
@@ -205,6 +206,24 @@ on a tie either repeats a sibling or drops one, on precisely the rows a release 
 The pair supports `occurred_at < :at or (occurred_at = :at and id < :id)`, which has no such gap. The
 list's sort carries the id for the same reason: without it a tied pair comes back in whatever order
 the database picked this time, and the log's order is not reproducible across two identical requests.
+
+**`order=asc` is the same page read forward, and it exists for durable consumers.** A consumer that
+tracks what it has handled keeps the last row it processed as a **watermark**, and after a restart or
+a cutover it has to read *forward* from that row to the head — the events it missed while it was not
+listening. Descending cannot express that: it walks away from the watermark, so the consumer would
+have to page all of history back to its own position and reverse it. Ascending flips the sort **and
+the cursor comparison** together:
+
+    desc:  occurred_at < :at or (occurred_at = :at and id < :id)
+    asc:   occurred_at > :at or (occurred_at = :at and id > :id)
+
+Both halves turn round, which is what keeps a fork's siblings splitting cleanly across a page
+boundary in either direction — a `before`/`after` cursor over `occurredAt` alone is lossy both ways.
+`nextCursor` is still the page's last row, so a consumer stores it as its watermark and sends it back
+verbatim; the row it names is excluded and nothing beside it is. Every filter composes unchanged, and
+a request that says nothing about order gets exactly what it always got. An `order` this service
+cannot read is a `400` rather than a fallback to `desc`: answering a catch-up consumer with the head
+of the log would let it record a watermark it never reached.
 
 **`q` searches the payload as a string and parses nothing.** There is no one key that means "which
 repository" — a build names it under `repoId`, a release under `repository` — so `q=qits-stt` finds
@@ -245,7 +264,7 @@ That gives this repo a clone rule with two halves:
     git clone … && git submodule update --init
 
 - **The test suite needs neither node nor the submodule.** Quinoa is disabled by default in test
-  mode (`Quinoa is disabled by default in tests.`), so all 86 `@QuarkusTest`s are green against an
+  mode (`Quinoa is disabled by default in tests.`), so all 112 `@QuarkusTest`s are green against an
   empty `webui/` on a machine with no node at all — `./mvnw test`, measured.
 - **Anything that reaches `package` needs both**, and that includes `./mvnw verify`, which runs
   `package` on its way to failsafe. An uninitialised gitlink is an *empty directory*, and that is
