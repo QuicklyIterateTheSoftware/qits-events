@@ -9,8 +9,8 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * One reading of the log, parsed: which names, how far back, what text to look for, where to resume
- * and how many rows to hand back.
+ * One reading of the log, parsed: which names, how far back, what text to look for, where to resume,
+ * which way to run and how many rows to hand back.
  *
  * <p><b>The boundary passes the caller's text through and this record decides what it means.</b>
  * Every parameter arrives as a String — as {@code parentId} always has — rather than as a typed
@@ -28,6 +28,7 @@ public record EventQuery(
     String search,
     List<String> attrFilters,
     EventCursor cursor,
+    EventOrder order,
     int limit) {
 
   /**
@@ -75,12 +76,29 @@ public record EventQuery(
    */
   public static EventQuery of(
       String name, String since, String q, String cursor, String limit, List<String> attr) {
+    return of(name, since, q, cursor, limit, attr, null);
+  }
+
+  /**
+   * @param order {@code asc} or {@code desc}; absent is descending, the reading this route has
+   *     always answered. Ascending composes with every filter above it and changes nothing else —
+   *     see {@link EventOrder}.
+   */
+  public static EventQuery of(
+      String name,
+      String since,
+      String q,
+      String cursor,
+      String limit,
+      List<String> attr,
+      String order) {
     return new EventQuery(
         namesOf(name),
         sinceOf(since),
         searchOf(q),
         attrFiltersOf(attr),
         EventCursor.parse(cursor),
+        EventOrder.parse(order),
         limitOf(limit));
   }
 

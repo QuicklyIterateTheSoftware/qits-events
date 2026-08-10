@@ -1,5 +1,6 @@
 package eu.wohlben.qits.events.persistence;
 
+import eu.wohlben.qits.events.control.EventOrder;
 import eu.wohlben.qits.events.control.EventQuery;
 import eu.wohlben.qits.events.entity.Event;
 import io.quarkus.hibernate.orm.panache.PanacheRepositoryBase;
@@ -28,9 +29,21 @@ public class EventRepository implements PanacheRepositoryBase<Event, String> {
       Sort.by("occurredAt", Sort.Direction.Descending).and("id", Sort.Direction.Descending);
 
   /**
-   * One page of the log, newest first, filtered as the query says — and <b>one row more than was
-   * asked for</b>, so the caller can tell "this is the last page" from "this page happens to be
-   * full" without a second query and without a count.
+   * The same total order read the other way — for a durable consumer catching up from its watermark,
+   * which walks forward through history rather than backwards from the head.
+   *
+   * <p><b>Both halves are reversed, not just the first.</b> Sorting ascending by {@code occurredAt}
+   * and descending by id would still be a total order and would still be wrong: the cursor predicate
+   * compares the id in the direction the page runs, so a sort that disagreed with it would skip rows
+   * inside a tie — the exact failure the composite cursor exists to prevent.
+   */
+  private static final Sort OLDEST_FIRST =
+      Sort.by("occurredAt", Sort.Direction.Ascending).and("id", Sort.Direction.Ascending);
+
+  /**
+   * One page of the log, in the order the query asks for, filtered as it says — and <b>one row more
+   * than was asked for</b>, so the caller can tell "this is the last page" from "this page happens to
+   * be full" without a second query and without a count.
    */
   public List<Event> listPage(EventQuery query) {
     List<String> clauses = new ArrayList<>();
@@ -57,18 +70,25 @@ public class EventRepository implements PanacheRepositoryBase<Event, String> {
       clauses.add("lower(payload) like :" + name + " escape '!'");
       parameters.and(name, query.attrFilters().get(i));
     }
+    boolean ascending = query.order() == EventOrder.ASC;
     if (query.cursor() != null) {
-      // The composite predicate: strictly older, or the same instant and a smaller id. This is the
-      // half a scalar `before=<occurredAt>` cursor cannot express, and the reason a fork's siblings
-      // survive a page boundary.
-      clauses.add("(occurredAt < :cursorAt or (occurredAt = :cursorAt and id < :cursorId))");
+      // The composite predicate: strictly past the cursor's instant, or the same instant and an id
+      // past its id. This is the half a scalar `before=<occurredAt>` cursor cannot express, and the
+      // reason a fork's siblings survive a page boundary. Descending reads it as "older, or a
+      // smaller id at the same instant"; ascending is the same sentence with both comparisons
+      // turned round, so the row the cursor names is excluded either way and nothing beside it is.
+      String past = ascending ? ">" : "<";
+      clauses.add(
+          "(occurredAt " + past + " :cursorAt"
+              + " or (occurredAt = :cursorAt and id " + past + " :cursorId))");
       parameters.and("cursorAt", query.cursor().occurredAt()).and("cursorId", query.cursor().id());
     }
 
     // `1 = 1` is the unfiltered reading. Panache appends the sort to a where clause, so there has to
     // be one to append to.
     String where = clauses.isEmpty() ? "1 = 1" : String.join(" and ", clauses);
-    return find(where, NEWEST_FIRST, parameters).page(0, query.limit() + 1).list();
+    Sort sort = ascending ? OLDEST_FIRST : NEWEST_FIRST;
+    return find(where, sort, parameters).page(0, query.limit() + 1).list();
   }
 
   /**

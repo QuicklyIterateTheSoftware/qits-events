@@ -323,6 +323,155 @@ class EventApiTest {
   }
 
   @Test
+  void orderAscWalksTheLogOldestFirstFromAWatermark() {
+    // The catch-up read: a durable consumer keeps the last row it handled and pages FORWARD from it
+    // to the head. Same route, same cursor value, same end-of-log signal — the direction is the only
+    // thing that changes, and `desc` (and absent) is byte for byte what it always was.
+    // The stem-plus-nonce naming every test here uses: `theVocabularyHasEachNameOnceAndInOrder`
+    // reads the WHOLE table's names and compares the database's collation against Java's, and the
+    // two disagree about a space inside a name.
+    String nonce = nonce();
+    String stem = "AscWalk" + System.nanoTime();
+    for (int i = 1; i <= 5; i++) {
+      create(stem + "-" + i, "2026-0" + i + "-01T00:00:00Z", payloadWith(nonce), null);
+    }
+
+    var walked = new java.util.ArrayList<String>();
+    String cursor = null;
+    int pages = 0;
+    do {
+      var request = given().queryParam("q", nonce).queryParam("order", "asc").queryParam("limit", 2);
+      if (cursor != null) {
+        request = request.queryParam("cursor", cursor);
+      }
+      var body =
+          request.when().get("/events/api/events").then().statusCode(200).extract().jsonPath();
+      walked.addAll(body.getList("events.name", String.class));
+      cursor = body.getString("nextCursor");
+      pages++;
+    } while (cursor != null);
+
+    assertEquals(
+        java.util.List.of(stem + "-1", stem + "-2", stem + "-3", stem + "-4", stem + "-5"),
+        walked,
+        "ascending must walk every row exactly once, oldest first");
+    assertEquals(3, pages, "five rows in pages of two is three pages, the last one short");
+
+    // The same rows the other way round, so a consumer and the SPA cannot disagree about history.
+    given()
+        .queryParam("q", nonce)
+        .queryParam("order", "desc")
+        .when()
+        .get("/events/api/events")
+        .then()
+        .statusCode(200)
+        .body("events.name", contains(walked.reversed().toArray()));
+  }
+
+  @Test
+  void anAscendingPageBoundaryThatFallsOnATieSplitsItRatherThanLosingASibling() {
+    // The fork the live log is full of, met in the catch-up direction: two events published by one
+    // pipeline run carry the run's finish instant to the microsecond. A scalar `after=<occurredAt>`
+    // either skips the second sibling or repeats the first — and repeating one is an event handled
+    // twice, skipping one an event lost. The composite `<occurredAt>,<id>` resumes after a ROW.
+    String nonce = nonce();
+    String stem = "AscTie" + System.nanoTime();
+    String tie = "2026-08-01T08:52:23.928965Z";
+    create(stem + "-oldest", "2026-08-01T08:00:00Z", payloadWith(nonce), null);
+    create(stem + "-forkone", tie, payloadWith(nonce), null);
+    create(stem + "-forktwo", tie, payloadWith(nonce), null);
+    create(stem + "-newest", "2026-08-01T09:00:00Z", payloadWith(nonce), null);
+
+    var first =
+        given()
+            .queryParam("q", nonce)
+            .queryParam("order", "asc")
+            .queryParam("limit", 2)
+            .when()
+            .get("/events/api/events")
+            .then()
+            .statusCode(200)
+            .extract()
+            .jsonPath();
+    var ids = new java.util.ArrayList<>(first.getList("events.id", String.class));
+    String cursor = first.getString("nextCursor");
+    assertNotNull(cursor, "a full page with history ahead of it must say where to resume");
+    assertTrue(cursor.startsWith(tie + ","), "the boundary must fall on the tie; got " + cursor);
+
+    var second =
+        given()
+            .queryParam("q", nonce)
+            .queryParam("order", "asc")
+            .queryParam("limit", 2)
+            .queryParam("cursor", cursor)
+            .when()
+            .get("/events/api/events")
+            .then()
+            .statusCode(200)
+            .body("nextCursor", nullValue())
+            .extract()
+            .jsonPath();
+    ids.addAll(second.getList("events.id", String.class));
+
+    assertEquals(4, ids.size(), "every row exactly once across the tie: " + ids);
+    assertEquals(4, java.util.Set.copyOf(ids).size(), "and none of them twice: " + ids);
+  }
+
+  @Test
+  void ascendingComposesWithTheNameAndSinceFilters() {
+    // Catch-up is a filtered read — a consumer subscribes to a handful of names and resumes from a
+    // watermark — so the direction composes with the filters rather than replacing them.
+    String stem = "AscFilter" + System.nanoTime();
+    create(stem + "-build", "2026-07-01T09:00:00Z", null, null);
+    create(stem + "-build", "2026-08-01T09:00:00Z", null, null);
+    create(stem + "-scm", "2026-08-01T09:00:01Z", null, null);
+    create(stem + "-build", "2026-08-01T09:00:02Z", null, null);
+
+    given()
+        .queryParam("name", stem + "-build")
+        .queryParam("since", "2026-08-01T09:00:00Z")
+        .queryParam("order", "asc")
+        .when()
+        .get("/events/api/events")
+        .then()
+        .statusCode(200)
+        .body("events.occurredAt", contains("2026-08-01T09:00:00Z", "2026-08-01T09:00:02Z"));
+  }
+
+  @Test
+  void anUnknownOrderIsFourHundredAndAbsentIsNewestFirst() {
+    // order is a parameter this service defined, so a misspelling is a client error worth naming.
+    // Falling back to descending would answer a catch-up consumer with the head of the log and let
+    // it record a watermark it never reached.
+    given()
+        .queryParam("order", "sideways")
+        .when()
+        .get("/events/api/events")
+        .then()
+        .statusCode(400)
+        .contentType(ContentType.JSON)
+        .body("message", notNullValue());
+
+    String stem = "AscDefault" + System.nanoTime();
+    create(stem + "-older", "2026-08-01T09:00:00Z", null, null);
+    create(stem + "-newer", "2026-08-01T09:00:01Z", null, null);
+
+    // Absent, blank and `desc` are one answer: the reading this route has always given.
+    for (String order : new String[] {null, "", "desc", "DESC"}) {
+      var request = given().queryParam("name", stem + "-older," + stem + "-newer");
+      if (order != null) {
+        request = request.queryParam("order", order);
+      }
+      request
+          .when()
+          .get("/events/api/events")
+          .then()
+          .statusCode(200)
+          .body("events.name", contains(stem + "-newer", stem + "-older"));
+    }
+  }
+
+  @Test
   void thePageEnvelopeIsEventsAndNextCursorAndNothingElse() {
     // The shape the SPA is written against, and it is frozen: `events` and `nextCursor`, with
     // nextCursor null on the last page. No count, no hasMore — the extra row this route fetches

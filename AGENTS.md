@@ -16,7 +16,7 @@ right because the platform reference states it loosely:
 
 - `./mvnw test` — needs **neither node nor the webui submodule**, and no docker either. Quinoa is
   disabled by default in test mode (it says so: `Quinoa is disabled by default in tests.`), so all
-  102 `@QuarkusTest`s pass against an empty `webui/` on a machine with no node at all — the stream
+  112 `@QuarkusTest`s pass against an empty `webui/` on a machine with no node at all — the stream
   socket included, since a websocket is not a Quinoa concern. The store they run on is a real
   postgres the suite spawns itself from a Maven artifact. Measured, not assumed.
 - `./mvnw verify` — runs `package` on its way to failsafe, and `package` is where Quinoa augments.
@@ -203,9 +203,19 @@ The list route pages, and two of its properties are easy to undo by accident:
   `occurred_at < :at or (occurred_at = :at and id < :id)`. A scalar `before=<occurredAt>` is the
   obvious shape and it splits a fork across a page boundary — it either repeats a sibling or drops
   one. If a future change makes the pair look like ceremony, read `EventCursor`.
+- **`?order=asc` reads the same page forward, and both halves of the comparison flip with it:**
+  `occurred_at > :at or (occurred_at = :at and id > :id)`, sorted `(occurredAt asc, id asc)`. The
+  sort's id half has to turn round with its instant half — an ascending instant beside a descending
+  id is still a total order and still skips rows inside a tie, which is the exact failure the
+  composite cursor exists to prevent. `nextCursor` stays the page's last row in both directions, and
+  that is what a durable consumer keeps as its **watermark**: it catches up by paging ascending from
+  the last row it handled, which descending cannot express at all. An unreadable `order` is a 400
+  naming the parameter, like every other filter — falling back to `desc` would answer a catch-up
+  consumer with the head of the log and let it record a watermark it never reached. `EventOrder`
+  holds the reasoning and the parsing.
 
 `EventQuery` parses every filter, and the boundary hands it the caller's **text**: `limit`, `since`,
-`q`, `cursor` and `name` are all `String` `@QueryParam`s, and `attr` is a repeatable `List<String>` of
+`q`, `cursor`, `order` and `name` are all `String` `@QueryParam`s, and `attr` is a repeatable `List<String>` of
 the same unparsed text. That is deliberate — one place decides what a bad value means and every bad
 value is a 400 whose message names the parameter, where a JAX-RS parameter converter answers 404 for
 a query parameter it cannot convert, with no body worth reading. Blank is absent throughout, the rule
