@@ -11,12 +11,19 @@ it is the thing this repo exists to avoid. That is why the poms duplicate versio
 inheriting them, and why the suites spawn their own PostgreSQL from a Maven artifact rather than
 reaching for a container.
 
+**The one thing it now needs besides Maven Central** is the platform's own Maven repository, for
+`qits-db-core` and `qits-arch-rules` — the patient driver every connection opens through, and the
+test that refuses to let the datasource baseline go missing. `<repositories>` in the root pom points
+at `${qits.maven.repository.url}` (the developer-host address by default), and the image build
+overrides it; see **Dependencies**. Two published jars is what the platform's cutover survival costs,
+and it is the smallest form of it: neither has a copy that could live here instead.
+
 **Which command is the gate depends on whether you have the client**, and this is worth getting
 right because the platform reference states it loosely:
 
 - `./mvnw test` — needs **neither node nor the webui submodule**, and no docker either. Quinoa is
   disabled by default in test mode (it says so: `Quinoa is disabled by default in tests.`), so all
-  112 `@QuarkusTest`s pass against an empty `webui/` on a machine with no node at all — the stream
+  113 `@QuarkusTest`s pass against an empty `webui/` on a machine with no node at all — the stream
   socket included, since a websocket is not a Quinoa concern. The store they run on is a real
   postgres the suite spawns itself from a Maven artifact. Measured, not assumed.
 - `./mvnw verify` — runs `package` on its way to failsafe, and `package` is where Quinoa augments.
@@ -287,6 +294,17 @@ anything servlet-shaped. Check before adding anything that sounds like a web fra
 (`quinoa.version`) rather than beside the dependency. 2.8.2 is the last release built against a
 Quarkus *older* than the platform's 3.34.6; 2.8.3 is built against 3.36.2, ahead of us. Bump only
 when the platform's Quarkus passes the version a release is built against.
+
+**The two platform jars, and the three files they made this repo grow.** `qits-db-core` is
+**runtime** scope in `events/`, beside the `jdbc.driver` line that is the only thing naming it;
+`qits-arch-rules` is **test** scope in `service/`, whose classpath is the deployable's whole config.
+Both are published by qits-integrations-quarkus and version-pinned by a property each in the root
+pom. Getting them into an image build took the qits-deployments arrangement, unchanged: a
+`<repositories>` entry with the id `qits-maven`, `.qits-maven-settings.xml` mirroring exactly that id
+onto `$QITS_MAVEN_REPOSITORY_URL` (an exact id match is what gets past Maven's `external:http:*`
+blocker), and a `--build-arg` in `.config/qits/ci-post-receive.yml` deriving the address from
+`$QITS_REGISTRY`. The docker build also moved to `--network host`, which buildkit needs to reach it.
+The three move together — a new platform jar needs none of them again.
 
 ## Tests
 

@@ -62,11 +62,10 @@ COPY .mvn/ .mvn/
 RUN ./mvnw --version
 
 # The whole reactor, not a module list. `-am` builds service's dependency from source —
-# `qits-events-domain` is a 1.0.0-SNAPSHOT this repo never publishes (no distributionManagement, no
-# <repositories>), so a builder container with an empty ~/.m2 has nowhere else to get it. Copying
-# module by module would mean editing this file every time one is added, and forgetting to would
-# fail the build with an unresolved dependency rather than anything that names the real cause.
-# `.dockerignore` is what keeps this cheap.
+# `qits-events-domain` is a version this repo never publishes, so a builder container with an empty
+# ~/.m2 has nowhere else to get it. Copying module by module would mean editing this file every time
+# one is added, and forgetting to would fail the build with an unresolved dependency rather than
+# anything that names the real cause. `.dockerignore` is what keeps this cheap.
 COPY . .
 
 # -Dnative flips quarkus.native.enabled (service/pom.xml carries its own `native` profile). Cap
@@ -116,6 +115,15 @@ COPY . .
 #
 # One `cp` re-materialises it in the layer that is about to move it. It has to be in THIS `RUN` and
 # not a tidier one of its own — a layer boundary is exactly what it is undoing.
+# --- and where the two qits jars come from --------------------------------------------------------
+# This repo depends on qits-db-core (PatientPgDriver) and qits-arch-rules, which live only on the
+# platform's own Maven repository. Unlike the npm registry above, that one IS reachable from a build:
+# the CI recipe passes the address the step container can use, and `.qits-maven-settings.xml` mirrors
+# the `qits-maven` repository id onto it — an exact id match, which is what gets past Maven's
+# external:http:* blocker without permitting arbitrary HTTP repositories. The ARG default is the
+# developer-host address, so a plain host-side `docker build` still works.
+ARG QITS_MAVEN_REPOSITORY_URL=http://localhost:8081/artifacts/maven/maven
+ENV QITS_MAVEN_REPOSITORY_URL=$QITS_MAVEN_REPOSITORY_URL
 RUN d=service/src/main/webui/dist/qits-spa-events/browser; \
     test -f "$d/index.html" || { \
       echo "No built client at $d." >&2; \
@@ -123,7 +131,8 @@ RUN d=service/src/main/webui/dist/qits-spa-events/browser; \
       echo "in service/src/main/webui first — this stage cannot, see the Quinoa flags above." >&2; \
       exit 1; }; \
     cp -a "$d" "$d.layer" && rm -rf "$d" && mv "$d.layer" "$d" && \
-    ./mvnw -B -ntp -pl service -am package -Dnative -DskipTests \
+    ./mvnw -B -ntp -s .qits-maven-settings.xml -pl service -am package -Dnative -DskipTests \
+      -Dqits.maven.repository.url="$QITS_MAVEN_REPOSITORY_URL" \
       -Dquarkus.native.native-image-xmx=4g \
       -Dquarkus.quinoa.package-manager-install=true \
       -Dquarkus.quinoa.package-manager-install.node-version=22.22.0 \
