@@ -45,13 +45,14 @@
             <artifactId>quarkus-jdbc-postgresql</artifactId>
         </dependency>
         <dependency>
-            <!-- PatientPgDriver, which the datasource this module ships opens every connection
-                 through. RUNTIME scope: no code here names the class, only the `jdbc.driver` line
-                 in META-INF/microprofile-config.properties does — and the dependency sits beside
-                 that line so the two cannot drift apart. -->
+            <!-- Two things, and the second is why this is compile scope now. PatientPgDriver,
+                 which the datasource this module ships opens every connection through, is named
+                 only by the `jdbc.driver` line in META-INF/microprofile-config.properties — the
+                 dependency sits beside that line so the two cannot drift apart. DbRetry.inNewTx is
+                 named by EventService: both write paths run inside it, so the class has to be on
+                 the compile classpath. -->
             <groupId>${project.groupId}</groupId>
             <artifactId>qits-db-core</artifactId>
-            <scope>runtime</scope>
         </dependency>
         <dependency>
             <groupId>io.quarkus</groupId>

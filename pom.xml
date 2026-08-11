@@ -38,12 +38,13 @@
     <properties>
         <!-- THE PLATFORM'S OWN MAVEN REPOSITORY, and this repo's first two artifacts from it:
              qits-db-core (PatientPgDriver, which the events datasource opens every connection
-             through) and qits-arch-rules (the test that refuses to let the datasource baseline go
-             missing). Both are published by qits-integrations-quarkus. The url is a property so the
+             through, and DbRetry.inNewTx, which the two write paths run in) and qits-arch-rules
+             (the test that refuses to let the datasource baseline go missing). Both are published
+             by qits-integrations-quarkus. The url is a property so the
              image build can point it at the address the builder container can actually reach —
              see docker/Dockerfile and .qits-maven-settings.xml. -->
-        <qits.db-core.version>2026.811.152803</qits.db-core.version>
-        <qits.arch-rules.version>2026.811.152803</qits.arch-rules.version>
+        <qits.db-core.version>2026.811.165001</qits.db-core.version>
+        <qits.arch-rules.version>2026.811.165001</qits.arch-rules.version>
         <qits.maven.repository.url>http://localhost:8081/artifacts/maven/maven</qits.maven.repository.url>
         <maven.compiler.release>25</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
@@ -162,8 +163,9 @@
                 <version>${project.version}</version>
             </dependency>
             <dependency>
-                <!-- PatientPgDriver. Runtime scope wherever it is declared: no code here names the
-                     class, only the datasource's `jdbc.driver` line does. -->
+                <!-- PatientPgDriver, named only by the datasource's `jdbc.driver` line, and
+                     DbRetry.inNewTx, which EventService's two write paths call. The second is why
+                     `events` declares it at compile scope rather than runtime. -->
                 <groupId>${project.groupId}</groupId>
                 <artifactId>qits-db-core</artifactId>
                 <version>${qits.db-core.version}</version>

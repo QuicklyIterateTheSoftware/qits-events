@@ -1,5 +1,6 @@
 package eu.wohlben.qits.events.control;
 
+import eu.wohlben.qits.db.DbRetry;
 import eu.wohlben.qits.events.dto.EventCreated;
 import eu.wohlben.qits.events.entity.Event;
 import eu.wohlben.qits.events.error.BadRequestException;
@@ -116,21 +117,18 @@ public class EventService {
    * recording by hand rarely has a cause to name, but the two write paths must not be able to
    * disagree about what an event <em>is</em>: a field the bus accepts and the manual path silently
    * dropped would be a second definition of the envelope hiding behind one entity.
+   *
+   * <p>The insert runs inside {@link DbRetry#inNewTx}, so a connection lost mid-statement costs a
+   * pause rather than a 500. Validation and the id run <em>outside</em> it: a 400 should not open a
+   * transaction, and the retried body has to be database work and nothing else.
    */
-  @Transactional
   public Event create(
       String name, Instant occurredAt, String payload, String description, String parentId) {
     Validations.requireText(name, "name");
-    Event event = new Event();
-    event.id = UUID.randomUUID().toString();
-    event.name = name;
-    event.occurredAt = atStoredPrecision(occurredAt == null ? Instant.now() : occurredAt);
-    event.payload = payload;
-    event.description = description;
-    event.parentId = causeOf(event.id, parentId);
-    eventRepository.persist(event);
-    announce(event);
-    return event;
+    String id = UUID.randomUUID().toString();
+    Instant when = atStoredPrecision(occurredAt == null ? Instant.now() : occurredAt);
+    String cause = causeOf(id, parentId);
+    return DbRetry.inNewTx("record an event", () -> store(id, name, when, payload, description, cause));
   }
 
   /**
@@ -167,8 +165,13 @@ public class EventService {
    *
    * <p>{@code payload} is compared as an opaque string. This server never canonicalizes it; the
    * publisher does, and both sides of the equality are therefore the publisher's own bytes.
+   *
+   * <p><b>This is the platform's hub write</b> — every outbox in the fleet retries against it — so
+   * the whole decision runs inside {@link DbRetry#inNewTx}. A connection lost while the row is being
+   * written is held through rather than answered as a 500, which is the difference between one
+   * pause here and a retry storm across every publisher. The retried body is the lookup and the
+   * insert; validation and the parent check stay outside it, where a 400 costs no transaction.
    */
-  @Transactional
   public Published publish(
       String id,
       String name,
@@ -184,19 +187,17 @@ public class EventService {
     Validations.requirePresent(occurredAt, "occurredAt");
     Instant when = atStoredPrecision(occurredAt);
     String cause = causeOf(id, parentId);
+    return DbRetry.inNewTx(
+        "publish an event", () -> decide(id, name, when, payload, description, cause));
+  }
 
+  /** One attempt at {@link #publish}: the whole of it, and nothing that is not database work. */
+  private Published decide(
+      String id, String name, Instant when, String payload, String description, String cause) {
     Event existing = eventRepository.findById(id);
     if (existing == null) {
-      Event event = new Event();
-      event.id = id;
-      event.name = name;
-      event.occurredAt = when;
-      event.payload = payload;
-      event.description = description;
-      event.parentId = cause;
-      eventRepository.persist(event);
-      announce(event);
-      return new Published(event, PublishOutcome.CREATED);
+      return new Published(
+          store(id, name, when, payload, description, cause), PublishOutcome.CREATED);
     }
 
     if (!name.equals(existing.name)
@@ -212,6 +213,36 @@ public class EventService {
   @Transactional
   public void delete(String id) {
     eventRepository.delete(get(id));
+  }
+
+  /**
+   * The row, written — the one insert both write paths share, and the one place the retried body
+   * ends.
+   *
+   * <p><b>The flush is not decoration.</b> Hibernate defers an insert of an entity with an assigned
+   * id to commit time, and a connection that dies during a commit is the one failure {@link
+   * DbRetry#inNewTx} cannot classify: the row may be in the database with the answer lost on the way
+   * back. Flushing here puts the INSERT on the wire inside the body, where a lost connection is
+   * <em>known</em> to have written nothing and a second attempt is safe.
+   *
+   * <p><b>The announce is a database-only statement in the sense that matters.</b> {@link
+   * EventCreated} is observed {@code AFTER_SUCCESS}, so firing it registers a transaction
+   * synchronization and nothing more; an attempt that rolls back notifies nobody, and subscribers
+   * see exactly one frame per committed row however many attempts it took.
+   */
+  private Event store(
+      String id, String name, Instant when, String payload, String description, String cause) {
+    Event event = new Event();
+    event.id = id;
+    event.name = name;
+    event.occurredAt = when;
+    event.payload = payload;
+    event.description = description;
+    event.parentId = cause;
+    eventRepository.persist(event);
+    eventRepository.flush();
+    announce(event);
+    return event;
   }
 
   private void announce(Event event) {
