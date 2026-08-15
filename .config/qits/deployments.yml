@@ -11,6 +11,9 @@
 # whichever tier listens to the built branch.
 deployment_target: environment
 
+routes: /events
+navigation: Events:6
+
 # THE STORE, DECLARED RATHER THAN CONFIGURED. This service's log is PostgreSQL, and the line below
 # is what provisions it: a role and a database of its own on the tier's postgres, created before the
 # successor container starts and injected as QITS_RESOURCE_DB_URL / _USERNAME / _PASSWORD — the
