@@ -1,7 +1,7 @@
 package eu.wohlben.qits.events.security;
 
 import static io.restassured.RestAssured.given;
-import static org.hamcrest.Matchers.empty;
+import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.equalTo;
 
 import io.quarkus.test.junit.QuarkusTest;
@@ -61,17 +61,39 @@ class ForwardAuthTest {
   }
 
   @Test
-  void theIdentityCarriesNoRoles() {
-    // The gateway emits no groups header and makes the one role decision the system has, so a role
-    // arriving here would mean something upstream had started asserting one.
+  void theIdentityCarriesForwardedRoles() {
+    // The service consumes the role set asserted from the same edge session as the user.
+    // Jakarta security annotations then make the boundary decision from this identity.
     given()
         .header("X-Qits-User", "alice")
-        .header("X-Qits-Groups", "admin")
+        .header("X-Qits-Roles", "qits:admin")
         .when()
         .get("/events/api/test-identity")
         .then()
         .statusCode(200)
         .body("principal", equalTo("alice"))
-        .body("roles", empty());
+        .body("roles", contains("qits:admin"));
+  }
+
+  @Test
+  void theAdminBoundaryAcceptsTheQitsAdminRole() {
+    given()
+        .header("X-Qits-User", "alice")
+        .header("X-Qits-Roles", "qits:admin")
+        .when()
+        .get("/events/api/events")
+        .then()
+        .statusCode(200);
+  }
+
+  @Test
+  void theAdminBoundaryRejectsAnotherRole() {
+    given()
+        .header("X-Qits-User", "alice")
+        .header("X-Qits-Roles", "qits-platform:admin")
+        .when()
+        .get("/events/api/events")
+        .then()
+        .statusCode(403);
   }
 }

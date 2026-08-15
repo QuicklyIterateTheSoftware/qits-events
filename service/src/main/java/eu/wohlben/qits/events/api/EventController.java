@@ -110,6 +110,7 @@ public class EventController {
    * own depth and remember the ids it has seen</b>, because nothing here prevents a cycle.
    */
   @GET
+  @jakarta.annotation.security.RolesAllowed("qits:admin")
   public ListEventsRequest.Response list(
       @QueryParam("parentId") String parentId,
       @QueryParam("name") String name,
@@ -146,6 +147,7 @@ public class EventController {
    */
   @GET
   @Path("/names")
+  @jakarta.annotation.security.RolesAllowed("qits:admin")
   public ListEventNamesRequest.Response names() {
     return new ListEventNamesRequest.Response(eventService.names());
   }
@@ -160,6 +162,7 @@ public class EventController {
 
   @GET
   @Path("/{id}")
+  @jakarta.annotation.security.RolesAllowed("qits:admin")
   public GetEventRequest.Response get(@PathParam("id") String id) {
     return new GetEventRequest.Response(eventMapper.toDto(eventService.get(id)));
   }
@@ -185,6 +188,7 @@ public class EventController {
   }
 
   @POST
+  @jakarta.annotation.security.RolesAllowed("qits:admin")
   public CreateEventRequest.Response create(@Valid CreateEventRequest request) {
     var event =
         eventService.create(
@@ -241,6 +245,7 @@ public class EventController {
    */
   @PUT
   @Path("/{id}")
+  @jakarta.annotation.security.RolesAllowed("qits:system")
   public RestResponse<PublishEventRequest.Response> publish(
       @PathParam("id") String id, @Valid PublishEventRequest request) {
     var published =
@@ -265,6 +270,7 @@ public class EventController {
 
   @DELETE
   @Path("/{id}")
+  @jakarta.annotation.security.RolesAllowed("qits:admin")
   public DeleteEventRequest.Response delete(@PathParam("id") String id) {
     eventService.delete(id);
     return new DeleteEventRequest.Response(true);

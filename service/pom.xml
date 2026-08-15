@@ -90,8 +90,8 @@
                  service does about auth: read qits-gateway's X-Qits-User header into an identity
                  (see security/ForwardAuthMechanism). NOT an auth variant and NOT an authorization
                  policy — authentication terminates at the gateway. -->
-            <groupId>io.quarkus</groupId>
-            <artifactId>quarkus-security</artifactId>
+            <groupId>${project.groupId}</groupId>
+            <artifactId>qits-auth-core</artifactId>
         </dependency>
         <dependency>
             <groupId>io.quarkus</groupId>
