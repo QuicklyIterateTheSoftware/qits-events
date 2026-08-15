@@ -108,9 +108,9 @@ public class EventController {
    * <p>There is deliberately no chain, depth or root endpoint; upwards is {@code GET /{id}}
    * following {@code parentId}, downwards is this, and a client that walks either <b>must bound its
    * own depth and remember the ids it has seen</b>, because nothing here prevents a cycle.
-   */
+  */
   @GET
-  @jakarta.annotation.security.RolesAllowed("qits:admin")
+  @jakarta.annotation.security.RolesAllowed({"qits:admin", "qits:system"})
   public ListEventsRequest.Response list(
       @QueryParam("parentId") String parentId,
       @QueryParam("name") String name,
