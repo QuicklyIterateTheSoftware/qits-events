@@ -7,17 +7,26 @@
 # (`qits.workspaces.release.entry-branch`). `deploy_branches` used to name that branch here, in
 # thirteen copies of one platform-wide answer, and a release pushed onto every entry it named.
 #
-# ENVIRONMENT service: every environment runs its own instance, and a green build deploys into
-# whichever tier listens to the built branch.
-deployment_target: environment
+# PLATFORM service: one bus serves every environment, so one instance exists rather than one per
+# tier. It deploys from the PLATFORM ENVIRONMENT's branch and no other tier's — which tier that is,
+# is `pd_environment.platform` in the deployer, set by the bootstrap's --platform-env.
+#
+# THIS WAS AN ENVIRONMENT SERVICE until 2026-08-17, one broker per tier. Scoping came from WHICH
+# broker instance a service dialled — there are no topics here, routing is the event signature plus
+# each consumer's own watermark — so a per-tier bus was also a per-tier wall: a platform service
+# could publish onto one tier's bus only. One bus removes the wall, and the wire alias loses its
+# tier prefix with it: `qits-events`, which is what the eventstream library already defaults to.
+deployment_target: platform
 
 routes: /events
 navigation: Events:6
 
 # THE STORE, DECLARED RATHER THAN CONFIGURED. This service's log is PostgreSQL, and the line below
-# is what provisions it: a role and a database of its own on the tier's postgres, created before the
-# successor container starts and injected as QITS_RESOURCE_DB_URL / _USERNAME / _PASSWORD — the
-# generic contract the events jar's datasource defaults read verbatim.
+# is what provisions it: a role and a database of its own on the platform environment's postgres —
+# a platform service has no tier to derive one from — created before the successor container starts
+# and injected as QITS_RESOURCE_DB_URL / _USERNAME / _PASSWORD — the generic contract the events
+# jar's datasource defaults read verbatim. The database name does not change with the flip, so the
+# durable log carries over wherever the platform environment is the tier this service ran on.
 #
 # The third segment is omitted, so the database is the default derivation: the application name
 # minus its `qits-` prefix, dashes to underscores, under a `qits_` prefix — `qits_events`. Spelling

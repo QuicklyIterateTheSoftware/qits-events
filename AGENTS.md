@@ -138,6 +138,15 @@ them; the duplication is the decision, not an oversight.
 
 ## The bus
 
+**One instance serves the whole platform.** `.config/qits/deployments.yml` says
+`deployment_target: platform`, and the wire alias is the bare `qits-events` — no tier prefix — which
+is what the eventstream library defaults to. Until 2026-08-17 each environment ran a broker of its
+own, and that was the only scoping this service ever had: there are no topics here, routing is the
+event signature plus each consumer's own watermark, so *which instance you dialled* was the whole
+boundary. Nothing in this repo encoded a tier, which is why the flip is a declaration and not a
+change of behaviour — but read a request for a per-environment view as a feature that does not
+exist yet, not as one that regressed.
+
 `PUT /events/api/events/{id}` and `/events/stream` are the two surfaces that make this a bus rather
 than a log, and the wire contract for both is frozen in `eventsourcing-plan.md` in the superproject.
 Three things about it are load-bearing here:
@@ -251,7 +260,7 @@ characters ahead of a template so it wins, but that is a spec guarantee being le
 **It is PostgreSQL, and it is declared rather than configured.** `.config/qits/deployments.yml`
 carries `resources: postgresql:db`; qits-platform-deployments creates the role and the database
 (`qits_events` — the default derivation: the application name minus its `qits-` prefix, under a
-`qits_` prefix) on the tier's postgres before the successor container starts, and injects
+`qits_` prefix) on the platform environment's postgres before the successor container starts, and injects
 `QITS_RESOURCE_DB_URL` / `_USERNAME` / `_PASSWORD`. The events jar's shipped defaults expand exactly
 those three names, and **nothing else**: there is no fallback url, so an unset variable leaves the
 expression unresolvable and the process dies at Flyway naming the missing name rather than opening a
