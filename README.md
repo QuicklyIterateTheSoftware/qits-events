@@ -107,6 +107,13 @@ ignored. Ignoring it does not unregister the route — the upgrade still works, 
 
 ## The bus
 
+**There is one of it.** This is a platform service — `deployment_target: platform`, wire alias
+`qits-events` with no tier prefix — so every environment publishes onto and reads from the same
+broker. Each environment used to run its own, and that instance *was* the scoping: this service has
+no topics and no tenant column, and routing is the event signature plus each consumer's own
+watermark. Consumers keep their watermarks in their own `eventstream` databases, so one bus changes
+where they dial and nothing about what they have already handled.
+
 Two things make this an event *bus* rather than an event *log*:
 
     PUT /events/api/events/{id}    idempotent publish under the publisher's own UUID
@@ -293,7 +300,8 @@ Storage is **declared, not configured**. `.config/qits/deployments.yml` carries 
     resources: postgresql:db
 
 — and qits-platform-deployments creates the role and the database (`qits_events`, derived from the
-application name) on the tier's PostgreSQL before the successor container starts, then injects
+application name) on the platform environment's PostgreSQL — this is a platform service, so it has
+no tier of its own — before the successor container starts, then injects
 
     QITS_RESOURCE_DB_URL / QITS_RESOURCE_DB_USERNAME / QITS_RESOURCE_DB_PASSWORD
 

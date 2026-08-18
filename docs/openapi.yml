@@ -142,9 +142,17 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Response2"
+        "401":
+          description: Not Authorized
+        "403":
+          description: Not Allowed
       summary: List
       tags:
       - Event Controller
+      security:
+      - SecurityScheme:
+        - qits:admin
+        - qits:system
     post:
       requestBody:
         content:
@@ -159,11 +167,18 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Response5"
+        "401":
+          description: Not Authorized
+        "403":
+          description: Not Allowed
         "400":
           description: Bad Request
       summary: Create
       tags:
       - Event Controller
+      security:
+      - SecurityScheme:
+        - qits:admin
   /events/api/events/names:
     get:
       responses:
@@ -173,9 +188,16 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Response1"
+        "401":
+          description: Not Authorized
+        "403":
+          description: Not Allowed
       summary: Names
       tags:
       - Event Controller
+      security:
+      - SecurityScheme:
+        - qits:admin
   /events/api/events/{id}:
     put:
       parameters:
@@ -197,11 +219,18 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Response"
+        "401":
+          description: Not Authorized
+        "403":
+          description: Not Allowed
         "400":
           description: Bad Request
       summary: Publish
       tags:
       - Event Controller
+      security:
+      - SecurityScheme:
+        - qits:system
     get:
       parameters:
       - name: id
@@ -216,9 +245,16 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Response3"
+        "401":
+          description: Not Authorized
+        "403":
+          description: Not Allowed
       summary: Get
       tags:
       - Event Controller
+      security:
+      - SecurityScheme:
+        - qits:admin
     delete:
       parameters:
       - name: id
@@ -233,9 +269,16 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Response4"
+        "401":
+          description: Not Authorized
+        "403":
+          description: Not Allowed
       summary: Delete
       tags:
       - Event Controller
+      security:
+      - SecurityScheme:
+        - qits:admin
 info:
   title: qits-events API
-  version: 2026.807.123727
+  version: 2026.812.155553
